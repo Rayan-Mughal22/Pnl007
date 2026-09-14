@@ -99,6 +99,24 @@ log = logging.getLogger("wavebot")
 # symbol -> list of open positions: [{"qty":.., "entry_price":.., "entry_time":.., "stage":..}]
 _open_positions = {}
 _realized_pnl_total = 0.0
+_entries_taken = {}  # f"{symbol}-{stage}-{candle_open_time}" -> timestamp added (dedup guard)
+
+
+def _entry_already_taken(symbol: str, stage: str, candle_key) -> bool:
+    key = f"{symbol}-{stage}-{candle_key}"
+    return key in _entries_taken
+
+
+def _mark_entry_taken(symbol: str, stage: str, candle_key):
+    key = f"{symbol}-{stage}-{candle_key}"
+    _entries_taken[key] = time.time()
+
+
+def _prune_old_entries():
+    cutoff = time.time() - 24 * 3600
+    stale = [k for k, ts in _entries_taken.items() if ts < cutoff]
+    for k in stale:
+        del _entries_taken[k]
 
 
 # ----------------------------- TELEGRAM ----------------------------------
@@ -338,7 +356,21 @@ def analyze_symbol(df: pd.DataFrame):
                 rally_candles = []
 
     if entry_index == last_closed_idx:
-        return entry_stage, entry_price
+        candle_key = df.iloc[last_closed_idx]["open_time"]
+        return entry_stage, entry_price, candle_key
+
+    # No breakout found in fully-closed candles -- also check the LIVE
+    # (still-forming) candle. Waiting for a candle to fully close before
+    # reacting means entries land several minutes late, often at a much
+    # worse price than the actual breakout. If we're currently watching
+    # for a breakout and the live candle has already crossed the level,
+    # enter now instead of waiting up to 5 more minutes.
+    if phase == "WATCH_BREAKOUT" and n >= 1:
+        live = df.iloc[-1]
+        if live["high"] > pullback_first_high:
+            candle_key = live["open_time"]
+            return stage_after_pullback, live["close"], candle_key
+
     return None
 
 
@@ -462,19 +494,22 @@ def process_symbol(symbol: str, df, tradeable: bool):
 
     result = analyze_symbol(df)
     if result:
-        stage, price = result
-        tag = "🟢 SPOT" if tradeable else "🟡 ALPHA (manual only)"
-        msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m"
-        log.info("SIGNAL: %s", msg.replace(chr(10), " | "))
-        send_telegram(msg)
-        if tradeable and ENABLE_TRADING:
-            open_long(symbol, stage)
+        stage, price, candle_key = result
+        if not _entry_already_taken(symbol, stage, candle_key):
+            _mark_entry_taken(symbol, stage, candle_key)
+            tag = "ðŸŸ¢ SPOT" if tradeable else "ðŸŸ¡ ALPHA (manual only)"
+            msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m"
+            log.info("SIGNAL: %s", msg.replace(chr(10), " | "))
+            send_telegram(msg)
+            if tradeable and ENABLE_TRADING:
+                open_long(symbol, stage)
 
     if tradeable and symbol in _open_positions and check_exit(df):
         close_all_for_symbol(symbol)
 
 
 def scan_once():
+    _prune_old_entries()
     spot_symbols = get_usdt_symbols()
     alpha_tokens = get_alpha_tokens()
     log.info("Scanning %d spot pairs + %d Alpha tokens...", len(spot_symbols), len(alpha_tokens))
@@ -504,7 +539,7 @@ def main():
         bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID), ENABLE_TRADING,
         ACCOUNT_BUDGET_USDT, TRADE_SIZE_USDT, MAX_CONCURRENT_TRADES
     )
-    send_telegram("✅ Wave strategy bot is online (Spot + Alpha scanning).")
+    send_telegram("âœ… Wave strategy bot is online (Spot + Alpha scanning).")
     executor = ThreadPoolExecutor(max_workers=1)
     while True:
         start = time.time()
@@ -528,4 +563,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()                            
