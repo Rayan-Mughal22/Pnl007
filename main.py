@@ -228,12 +228,30 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _rvol_ok(row) -> bool:
+def _best_rvol_ratio(row):
+    """Returns (period, ratio) for whichever MA period gives the HIGHEST
+    volume ratio (for logging), regardless of whether it clears the
+    threshold -- use _rvol_ok() for the pass/fail check."""
+    best_period, best_ratio = None, 0.0
     for p in VOL_MA_PERIODS:
         ma = row.get(f"vol_ma_{p}")
-        if ma is not None and not math.isnan(ma) and ma > 0 and row["volume"] >= VOL_MULTIPLIER * ma:
-            return True
-    return False
+        if ma is not None and not math.isnan(ma) and ma > 0:
+            ratio = row["volume"] / ma
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_period = p
+    return best_period, best_ratio
+
+
+def _rvol_ok(row) -> bool:
+    _, best_ratio = _best_rvol_ratio(row)
+    return best_ratio >= VOL_MULTIPLIER
+
+
+def _macd_detail(row) -> str:
+    diff = row["macd"] - row["macd_signal"]
+    state = "above" if diff > 0 else "below"
+    return f"MACD {state} signal (macd={row['macd']:.6f}, signal={row['macd_signal']:.6f}, diff={diff:.6f})"
 
 
 def _trend_ok(row) -> bool:
@@ -242,6 +260,34 @@ def _trend_ok(row) -> bool:
 
 def _macd_ok(row) -> bool:
     return row["macd"] > row["macd_signal"]
+
+
+def _avg_vol(cands):
+    return sum(c["volume"] for c in cands) / len(cands) if cands else 0
+
+
+def _breakout_confirmed(row, pullback_first_high, prev_volume) -> bool:
+    """A breakout fires the instant price crosses the pullback's first red
+    candle's high (wick included), with volume showing at least some
+    increase vs. the immediately preceding candle -- checked live on the
+    still-forming candle too (not just after it closes), so entry doesn't
+    lag behind the actual breakout."""
+    if row["high"] <= pullback_first_high:
+        return False
+    if prev_volume is not None and row["volume"] < prev_volume:
+        return False
+    return True
+
+
+def _entry_detail(row) -> dict:
+    period, ratio = _best_rvol_ratio(row)
+    return {
+        "rvol_ratio": ratio,
+        "rvol_period": period,
+        "macd": row["macd"],
+        "macd_signal": row["macd_signal"],
+        "macd_above_signal": row["macd"] > row["macd_signal"],
+    }
 
 
 # ----------------------------- WAVE STATE MACHINE --------------------------
@@ -269,12 +315,10 @@ def analyze_symbol(df: pd.DataFrame):
     entry_index = None
     entry_stage = None
     entry_price = None
-
-    def avg_body(cands):
-        return sum(abs(c["body_pct"]) for c in cands) / len(cands) if cands else 0
+    entry_detail = None
 
     def avg_vol(cands):
-        return sum(c["volume"] for c in cands) / len(cands) if cands else 0
+        return _avg_vol(cands)
 
     for i in range(start_idx, last_closed_idx + 1):
         row = df.iloc[i]
@@ -302,7 +346,14 @@ def analyze_symbol(df: pd.DataFrame):
                 r_high, r_low = rally_range[1], rally_range[0]
                 r_size = r_high - r_low
                 retrace = r_high - row["low"]
-                if r_size > 0 and (retrace / r_size) >= INVALIDATION_RETRACE_PCT:
+                rally_avg_vol = avg_vol(rally_candles)
+                too_deep = r_size > 0 and (retrace / r_size) >= INVALIDATION_RETRACE_PCT
+                # Pullback volume must stay clearly BELOW the rally's own volume --
+                # if a pullback candle's volume gets too close to (or exceeds) the
+                # rally's volume, sellers are just as strong as buyers were, which
+                # contradicts a genuine "weak pullback".
+                too_heavy = rally_avg_vol > 0 and row["volume"] > PULLBACK_MAX_VOL_RATIO * rally_avg_vol
+                if too_deep or too_heavy:
                     phase = "WAIT_RALLY1"
                     rally_candles = []
             elif is_green:
@@ -314,10 +365,11 @@ def analyze_symbol(df: pd.DataFrame):
                     # Check THIS candle for breakout too -- it may already cross
                     # the pullback high (previously only later candles were
                     # checked, which meant an immediate breakout was missed).
-                    if row["high"] > pullback_first_high:
+                    if _breakout_confirmed(row, pullback_first_high, pullback_candles[-1]["volume"]):
                         entry_index = i
                         entry_stage = stage_after_pullback
                         entry_price = row["close"]
+                        entry_detail = _entry_detail(row)
                         if stage_after_pullback == "rally2":
                             rally_range = (min(c["low"] for c in watch_candles), max(c["high"] for c in watch_candles))
                             rally_candles = list(watch_candles)
@@ -332,12 +384,13 @@ def analyze_symbol(df: pd.DataFrame):
 
         elif phase == "WATCH_BREAKOUT":
             if is_green:
+                prev_vol = watch_candles[-1]["volume"] if watch_candles else pullback_candles[-1]["volume"]
                 watch_candles.append(row)
-                vol_rising = len(watch_candles) < 2 or row["volume"] >= watch_candles[-2]["volume"]
-                if row["high"] > pullback_first_high and vol_rising:
+                if _breakout_confirmed(row, pullback_first_high, prev_vol):
                     entry_index = i
                     entry_stage = stage_after_pullback
                     entry_price = row["close"]
+                    entry_detail = _entry_detail(row)
                     if stage_after_pullback == "rally2":
                         # allow one more cycle (rally 3) before fully resetting
                         rally_range = (min(c["low"] for c in watch_candles), max(c["high"] for c in watch_candles))
@@ -357,7 +410,7 @@ def analyze_symbol(df: pd.DataFrame):
 
     if entry_index == last_closed_idx:
         candle_key = df.iloc[last_closed_idx]["open_time"]
-        return entry_stage, entry_price, candle_key
+        return entry_stage, entry_price, candle_key, entry_detail
 
     # No breakout found in fully-closed candles -- also check the LIVE
     # (still-forming) candle. Waiting for a candle to fully close before
@@ -367,9 +420,10 @@ def analyze_symbol(df: pd.DataFrame):
     # enter now instead of waiting up to 5 more minutes.
     if phase == "WATCH_BREAKOUT" and n >= 1:
         live = df.iloc[-1]
-        if live["high"] > pullback_first_high:
+        prev_vol = watch_candles[-1]["volume"] if watch_candles else pullback_candles[-1]["volume"]
+        if _breakout_confirmed(live, pullback_first_high, prev_vol):
             candle_key = live["open_time"]
-            return stage_after_pullback, live["close"], candle_key
+            return stage_after_pullback, live["close"], candle_key, _entry_detail(live)
 
     return None
 
@@ -415,7 +469,7 @@ def total_open_trades() -> int:
     return sum(len(v) for v in _open_positions.values())
 
 
-def open_long(symbol: str, stage: str):
+def open_long(symbol: str, stage: str, detail: dict = None):
     if total_open_trades() >= MAX_CONCURRENT_TRADES:
         log.info("Budget full (%d/%d trades) -- skipping %s entry on %s",
                   total_open_trades(), MAX_CONCURRENT_TRADES, stage, symbol)
@@ -437,8 +491,15 @@ def open_long(symbol: str, stage: str):
         "qty": qty, "entry_price": entry_price, "entry_fee": entry_fee,
         "entry_time": time.time(), "stage": stage
     })
-    log.info("TRADE OPEN  %s [%s] | qty=%.6f entry=%.6f cost=%.2f USDT (fee ~%.3f) | open trades=%d/%d",
-              symbol, stage, qty, entry_price, quote_spent, entry_fee, total_open_trades(), MAX_CONCURRENT_TRADES)
+    detail_str = ""
+    if detail:
+        detail_str = (
+            f" | RVOL={detail['rvol_ratio']:.2f}x (vs {detail['rvol_period']}-period MA) | "
+            f"MACD {'above' if detail['macd_above_signal'] else 'below'} signal "
+            f"(macd={detail['macd']:.6f}, signal={detail['macd_signal']:.6f})"
+        )
+    log.info("TRADE OPEN  %s [%s] | qty=%.6f entry=%.6f cost=%.2f USDT (fee ~%.3f) | open trades=%d/%d%s",
+              symbol, stage, qty, entry_price, quote_spent, entry_fee, total_open_trades(), MAX_CONCURRENT_TRADES, detail_str)
 
 
 def close_all_for_symbol(symbol: str):
@@ -494,15 +555,19 @@ def process_symbol(symbol: str, df, tradeable: bool):
 
     result = analyze_symbol(df)
     if result:
-        stage, price, candle_key = result
+        stage, price, candle_key, detail = result
         if not _entry_already_taken(symbol, stage, candle_key):
             _mark_entry_taken(symbol, stage, candle_key)
             tag = "ðŸŸ¢ SPOT" if tradeable else "ðŸŸ¡ ALPHA (manual only)"
             msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m"
-            log.info("SIGNAL: %s", msg.replace(chr(10), " | "))
+            log.info(
+                "SIGNAL: %s | RVOL=%.2fx (vs %s-period MA) | MACD %s signal (macd=%.6f, signal=%.6f)",
+                msg.replace(chr(10), " | "), detail["rvol_ratio"], detail["rvol_period"],
+                "above" if detail["macd_above_signal"] else "below", detail["macd"], detail["macd_signal"]
+            )
             send_telegram(msg)
             if tradeable and ENABLE_TRADING:
-                open_long(symbol, stage)
+                open_long(symbol, stage, detail)
 
     if tradeable and symbol in _open_positions and check_exit(df):
         close_all_for_symbol(symbol)
@@ -563,4 +628,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()                            
+    main()
