@@ -1,4 +1,4 @@
-"""
+ """
 Binance Wave Strategy Bot -- REAL-TIME (WebSocket) edition
 -------------------------------------------------------------
 Spot + Alpha scanning, Spot demo trading on Binance Testnet.
@@ -81,6 +81,7 @@ MAX_HISTORY_ROWS = 300           # trimmed window kept per symbol after seeding
 SEED_WORKERS = 24                # parallel REST calls during startup seeding
 SYMBOL_REFRESH_SECONDS = 3600    # re-seed + reconnect hourly to pick up new/delisted symbols
 STREAMS_PER_SUBSCRIBE = 200      # batch size for SUBSCRIBE messages
+DAILY_BREAKOUT_LOOKBACK_DAYS = 10  # entries also require price above the highest daily high of the last N days
 
 VOL_MA_PERIODS = [10, 20, 30, 50]
 VOL_MULTIPLIER = 1.0             # RVOL threshold vs. ANY ONE of the MA periods above
@@ -179,6 +180,44 @@ def get_spot_klines(symbol: str):
     if r.status_code != 200:
         return None
     return _parse_klines(r.json())
+
+
+def get_spot_daily_high(symbol: str, lookback_days: int = DAILY_BREAKOUT_LOOKBACK_DAYS):
+    """Highest daily HIGH over the last `lookback_days` FULLY CLOSED daily
+    candles (today's still-forming candle is excluded)."""
+    params = {"symbol": symbol, "interval": "1d", "limit": lookback_days + 1}
+    try:
+        r = requests.get(f"{BINANCE_BASE}/api/v3/klines", params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        raw = r.json()
+        if len(raw) < 2:
+            return None
+        closed = raw[:-1]  # drop today's still-forming candle
+        return max(float(c[2]) for c in closed)  # index 2 = high
+    except Exception as e:
+        log.warning("Failed to fetch daily high for %s: %s", symbol, e)
+        return None
+
+
+def get_alpha_daily_high(alpha_symbol: str, lookback_days: int = DAILY_BREAKOUT_LOOKBACK_DAYS):
+    url = f"{ALPHA_BASE}/bapi/defi/v1/public/alpha-trade/klines"
+    params = {"symbol": alpha_symbol, "interval": "1d", "limit": lookback_days + 1}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data.get("success"):
+            return None
+        raw = data.get("data", [])
+        if len(raw) < 2:
+            return None
+        closed = raw[:-1]
+        return max(float(c[2]) for c in closed)
+    except Exception as e:
+        log.warning("Failed to fetch Alpha daily high for %s: %s", alpha_symbol, e)
+        return None
 
 
 def get_alpha_klines(alpha_symbol: str):
@@ -523,6 +562,18 @@ _symbol_state = {}
 _alpha_symbol_to_name = {}  # "ALPHA_116USDT" -> "TOKEN" (human name for logs/telegram)
 
 
+def _run_bg(fn, *args):
+    """Fire-and-forget a blocking call (Telegram, Testnet order) on a
+    background thread so it can NEVER block the WebSocket event loop.
+    Without this, a single slow network call freezes ALL scanning --
+    both WebSocket connections and the heartbeat -- until it returns."""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, fn, *args)
+    except RuntimeError:
+        fn(*args)  # no running loop (shouldn't happen) -- fall back to direct call
+
+
 def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
     stage, price, candle_key, detail = entry_result
     if _entry_already_taken(symbol, stage, candle_key):
@@ -540,8 +591,19 @@ def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
         open_long(symbol, stage, detail)
 
 
-def seed_symbol(symbol: str, tradeable: bool):
-    df = get_spot_klines(symbol) if tradeable else get_alpha_klines(symbol)
+_daily_high_cache = {}  # symbol/name -> highest daily high over the lookback window
+
+
+def _daily_breakout_ok(symbol: str, price: float) -> bool:
+    daily_high = _daily_high_cache.get(symbol)
+    if daily_high is None:
+        return True  # don't block trades just because we don't have this data yet
+    return price > daily_high
+
+
+def seed_symbol(key: str, tradeable: bool, fetch_symbol: str = None):
+    fetch_symbol = fetch_symbol or key
+    df = get_spot_klines(fetch_symbol) if tradeable else get_alpha_klines(fetch_symbol)
     if df is None:
         return
     df = add_indicators(df)
@@ -549,7 +611,11 @@ def seed_symbol(symbol: str, tradeable: bool):
     # machine finds in old history, only store it so live ticks going
     # forward can react to genuinely NEW breakouts.
     _, watch_state = run_state_machine(df)
-    _symbol_state[symbol] = {"df": df, "tradeable": tradeable, "watch": watch_state}
+    _symbol_state[key] = {"df": df, "tradeable": tradeable, "watch": watch_state}
+
+    daily_high = get_spot_daily_high(fetch_symbol) if tradeable else get_alpha_daily_high(fetch_symbol)
+    if daily_high is not None:
+        _daily_high_cache[key] = daily_high
 
 
 def seed_all_symbols(spot_symbols, alpha_tokens):
@@ -560,14 +626,15 @@ def seed_all_symbols(spot_symbols, alpha_tokens):
         _alpha_symbol_to_name[t["alpha_symbol"].upper()] = t["name"]
 
     with ThreadPoolExecutor(max_workers=SEED_WORKERS) as ex:
-        futures = [ex.submit(seed_symbol, s, True) for s in spot_symbols]
-        futures += [ex.submit(seed_symbol, t["name"], False) for t in alpha_tokens]
+        futures = [ex.submit(seed_symbol, s, True, s) for s in spot_symbols]
+        futures += [ex.submit(seed_symbol, t["name"], False, t["alpha_symbol"]) for t in alpha_tokens]
         for f in futures:
             try:
                 f.result(timeout=30)
             except Exception as e:
                 log.warning("Seed error: %s", e)
-    log.info("Seeding complete. %d symbols loaded.", len(_symbol_state))
+    log.info("Seeding complete. %d symbols loaded, %d with daily-high data.",
+              len(_symbol_state), len(_daily_high_cache))
 
 
 def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
@@ -593,12 +660,17 @@ def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
     entry_result, watch_state = run_state_machine(df)
     state["watch"] = watch_state
     if entry_result:
-        _signal_and_maybe_trade(symbol, state["tradeable"], entry_result)
+        stage, price, candle_key, detail = entry_result
+        if _daily_breakout_ok(symbol, price):
+            _run_bg(_signal_and_maybe_trade, symbol, state["tradeable"], entry_result)
+        else:
+            log.info("Skipping %s [%s]: price %.6f hasn't broken the %d-day high too (5m setup alone isn't enough).",
+                      symbol, stage, price, DAILY_BREAKOUT_LOOKBACK_DAYS)
 
     if state["tradeable"] and symbol in _open_positions:
         last_row = df.iloc[-1]
         if check_exit_row(last_row):
-            close_all_for_symbol(symbol)
+            _run_bg(close_all_for_symbol, symbol)
 
 
 def on_live_tick(symbol: str, high: float, close: float, volume: float, open_time):
@@ -613,6 +685,8 @@ def on_live_tick(symbol: str, high: float, close: float, volume: float, open_tim
         stage = watch["stage"]
         if _entry_already_taken(symbol, stage, candle_key):
             return
+        if not _daily_breakout_ok(symbol, close):
+            return
         # Build a lightweight detail dict from the last known closed-candle
         # indicators (good enough for logging -- indicators don't move much
         # within one 5m candle).
@@ -626,11 +700,12 @@ def on_live_tick(symbol: str, high: float, close: float, volume: float, open_tim
             msg.replace(chr(10), " | "), detail["rvol_ratio"], detail["rvol_period"],
             "above" if detail["macd_above_signal"] else "below", detail["macd"], detail["macd_signal"]
         )
-        send_telegram(msg)
+        _run_bg(send_telegram, msg)
         if state["tradeable"] and ENABLE_TRADING:
-            open_long(symbol, stage, detail)
+            _run_bg(open_long, symbol, stage, detail)
         # Clear the watch so we don't refire every tick until the candle
         # closes and the state machine naturally rebuilds (possibly into
+
         # rally3 pullback-tracking).
         state["watch"] = None
 
@@ -729,4 +804,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()        
