@@ -1,64 +1,60 @@
 """
-Binance Wave Strategy Bot (Spot + Alpha scanning, Spot demo trading)
----------------------------------------------------------------------
-5-minute chart, fresh build. Scans:
-  - All Binance Spot USDT pairs (alerts + auto demo-trades on Testnet)
-  - All Binance Alpha tokens (alerts only -- Alpha can't be demo-traded,
-    it uses a different swap mechanism, not the classic order book)
+Binance Wave Strategy Bot -- REAL-TIME (WebSocket) edition
+-------------------------------------------------------------
+Spot + Alpha scanning, Spot demo trading on Binance Testnet.
 
-STRATEGY (as described)
-Trend filter (must hold): EMA9 > EMA20 > VWAP > EMA200
-Volume: current candle volume >= 2x AT LEAST ONE of the 10/20/30/50-period
-        volume moving averages (not all four at once)
-MACD: MACD line above its signal line (covers "already above" and the
-      moment just after crossing up)
+WHY THIS VERSION EXISTS
+The earlier version re-fetched every coin's candles over REST every ~1
+minute, which meant a full cycle took ~7 minutes across ~1150+ symbols --
+entries could land minutes after the real breakout, at a much worse price.
+This version instead opens a live WebSocket connection to Binance (one for
+Spot, one for Alpha) and reacts the instant a price update arrives -- no
+polling delay. Historical candles are still fetched once at startup (and
+once an hour on refresh) over REST, just to seed enough history for
+EMA200/VWAP/volume-MA to be meaningful; after that, everything is event-driven.
 
-Rally 1: 2+ consecutive green candles, each with a real body (>= RALLY_MIN_BODY_PCT),
-         with each candle's volume >= the previous one's (rising volume),
-         while trend + volume(RVOL) + MACD hold on the latest candle.
+STRATEGY (unchanged from the polling version)
+Trend filter: EMA9 > EMA20 > VWAP > EMA200
+Volume (rally1 formation only): RVOL >= 1x vs. ANY ONE of the 10/20/30/50
+                                 period volume moving averages
+MACD: MACD line above its signal line
 
-Pullback 1: 1-3 small red candles after rally 1 -- body and volume both
-            clearly smaller than the rally's own candles (buyers stepping
-            back, not sellers taking over).
-Invalidation: if a pullback candle has a BIG body (as big as the rally's
-              candles) and price retraces >=50% of rally 1's range -> this
-              setup is scrapped, back to looking for a fresh rally 1.
-
-Entry (rally 2): once green candles resume, watch up to 3 of them. The
-                  moment one closes above pullback 1's FIRST red candle's
-                  high, with rising green volume -> ENTRY.
-
-Rally 3: same mechanism can repeat once more after rally 2 (pullback 2,
-         breakout of pullback 2's first red candle's high) for a second,
-         separate entry on the same coin. No further entries after rally 3
-         in the same wave -- the state resets and looks for a brand new
-         rally 1 from scratch.
-
-EXIT: ride the green rally you entered on; exit the moment the FIRST red
-(pullback) candle appears right after it, taking whatever profit built up
-during that green run. Applies the same way to both the rally-2 entry and
-the rally-3 entry (each rides its own green run and exits on its own first
-red candle).
+Rally 1: 2+ consecutive green candles, real body (>= RALLY_MIN_BODY_PCT),
+         rising volume, with trend + RVOL + MACD holding on the latest candle.
+Pullback: 1-3+ red candles after rally 1. Invalidated if a pullback candle's
+          volume gets too close to/exceeds the rally's own average volume,
+          OR if retracement reaches INVALIDATION_RETRACE_PCT (30%) of the
+          rally's range.
+Entry (rally 2, then rally 3 once more): the INSTANT any green candle's high
+         crosses the pullback's first red candle's high (wick included),
+         with volume showing at least some increase vs. the immediately
+         preceding candle -- checked live, not just after candle close.
+Exit: the moment the first red candle appears right after the rally you
+      entered on -- take whatever profit built up.
 
 MONEY MANAGEMENT
-Demo account budget: $500 total. Each trade: $50. So at most 10 trades can
-be open across all coins at once (500 / 50). Both rally-2 and rally-3
-entries on the same coin count separately toward this cap.
+$500 demo budget, $50/trade, max 10 concurrent trades across all coins.
+Fees: Binance's standard 0.1%-per-side fee is subtracted from PnL even
+though the testnet itself charges 0%, so numbers reflect real-world cost.
 
-All the "how big is a good rally/pullback candle" numbers below are my own
-reasonable defaults (you asked me to pick these) -- tune them in CONFIG.
+Alpha tokens get alerts only (no demo trading -- Alpha doesn't use the
+classic order book Testnet supports), but now also get real-time WebSocket
+detection, same as Spot.
 """
 
 import os
 import time
 import math
+import json
 import hmac
 import hashlib
 import logging
+import asyncio
 import requests
 import pandas as pd
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import websockets
+from concurrent.futures import ThreadPoolExecutor
 
 # ----------------------------- CONFIG -----------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -76,46 +72,44 @@ FEE_RATE = 0.001  # Binance standard spot trading fee: 0.1% per side (entry + ex
 
 BINANCE_BASE = "https://api.binance.com"
 ALPHA_BASE = "https://www.binance.com"
+SPOT_WS_BASE = "wss://stream.binance.com:9443/stream"
+ALPHA_WS_BASE = "wss://nbstream.binance.com/w3w/wsa/stream/stream"
 KLINE_INTERVAL = "5m"
 KLINE_LIMIT = 260
 QUOTE_ASSET = "USDT"
-SCAN_INTERVAL_SECONDS = 60  # check every 1 minute; candles are still 5m
-SCAN_CYCLE_TIMEOUT_SECONDS = 900  # 15 min safety net -- a normal cycle takes ~7-8 min
+MAX_HISTORY_ROWS = 300           # trimmed window kept per symbol after seeding
+SEED_WORKERS = 24                # parallel REST calls during startup seeding
+SYMBOL_REFRESH_SECONDS = 3600    # re-seed + reconnect hourly to pick up new/delisted symbols
+STREAMS_PER_SUBSCRIBE = 200      # batch size for SUBSCRIBE messages
 
 VOL_MA_PERIODS = [10, 20, 30, 50]
 VOL_MULTIPLIER = 1.0             # RVOL threshold vs. ANY ONE of the MA periods above
 
-RALLY_MIN_BODY_PCT = 0.4         # min body % for a green rally / red invalidation candle
-PULLBACK_MAX_BODY_RATIO = 0.5    # pullback candle body must be <= 50% of avg rally candle body
+RALLY_MIN_BODY_PCT = 0.4         # min body % for a green rally candle
 PULLBACK_MAX_VOL_RATIO = 0.6     # pullback candle volume must be <= 60% of avg rally candle volume
 INVALIDATION_RETRACE_PCT = 0.30  # pullback retrace vs. rally's range must stay under 30%
-# No candle-count cap on the pullback -- it stays valid for as long as the
-# retracement stays under INVALIDATION_RETRACE_PCT, however many candles that takes.
 MAX_RALLY_WATCH_CANDLES = 3      # breakout must happen within this many new green candles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("wavebot")
 
-# symbol -> list of open positions: [{"qty":.., "entry_price":.., "entry_time":.., "stage":..}]
+# symbol -> list of open positions: [{"qty":.., "entry_price":.., "entry_fee":.., "entry_time":.., "stage":..}]
 _open_positions = {}
 _realized_pnl_total = 0.0
 _entries_taken = {}  # f"{symbol}-{stage}-{candle_open_time}" -> timestamp added (dedup guard)
 
 
 def _entry_already_taken(symbol: str, stage: str, candle_key) -> bool:
-    key = f"{symbol}-{stage}-{candle_key}"
-    return key in _entries_taken
+    return f"{symbol}-{stage}-{candle_key}" in _entries_taken
 
 
 def _mark_entry_taken(symbol: str, stage: str, candle_key):
-    key = f"{symbol}-{stage}-{candle_key}"
-    _entries_taken[key] = time.time()
+    _entries_taken[f"{symbol}-{stage}-{candle_key}"] = time.time()
 
 
 def _prune_old_entries():
     cutoff = time.time() - 24 * 3600
-    stale = [k for k, ts in _entries_taken.items() if ts < cutoff]
-    for k in stale:
+    for k in [k for k, ts in _entries_taken.items() if ts < cutoff]:
         del _entries_taken[k]
 
 
@@ -133,7 +127,7 @@ def send_telegram(message: str):
         log.error("Telegram send exception: %s", e)
 
 
-# ----------------------------- SPOT DATA ----------------------------------
+# ----------------------------- REST: SYMBOL DISCOVERY + SEEDING ------------
 def get_usdt_symbols():
     r = requests.get(f"{BINANCE_BASE}/api/v3/exchangeInfo", timeout=15)
     r.raise_for_status()
@@ -143,6 +137,27 @@ def get_usdt_symbols():
         if s["quoteAsset"] == QUOTE_ASSET and s["status"] == "TRADING"
         and s.get("isSpotTradingAllowed", True)
     ]
+
+
+def get_alpha_tokens():
+    """Returns list of dicts: {"alpha_symbol": "ALPHA_175USDT", "name": "TOKEN"}"""
+    url = f"{ALPHA_BASE}/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json().get("data", [])
+        out = []
+        for t in data:
+            alpha_id = t.get("alphaId")
+            symbol = t.get("symbol")
+            if alpha_id is None or not symbol:
+                continue
+            out.append({"alpha_symbol": f"ALPHA_{alpha_id}USDT", "name": symbol})
+        return out
+    except Exception as e:
+        log.warning("Failed to fetch Alpha token list: %s", e)
+        return []
 
 
 def _parse_klines(raw):
@@ -164,28 +179,6 @@ def get_spot_klines(symbol: str):
     if r.status_code != 200:
         return None
     return _parse_klines(r.json())
-
-
-# ----------------------------- ALPHA DATA ----------------------------------
-def get_alpha_tokens():
-    """Returns list of dicts: {"alpha_symbol": "ALPHA_175USDT", "name": "TOKEN"}"""
-    url = f"{ALPHA_BASE}/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return []
-        data = r.json().get("data", [])
-        out = []
-        for t in data:
-            alpha_id = t.get("alphaId")
-            symbol = t.get("symbol")
-            if alpha_id is None or not symbol:
-                continue
-            out.append({"alpha_symbol": f"ALPHA_{alpha_id}USDT", "name": symbol})
-        return out
-    except Exception as e:
-        log.warning("Failed to fetch Alpha token list: %s", e)
-        return []
 
 
 def get_alpha_klines(alpha_symbol: str):
@@ -229,9 +222,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _best_rvol_ratio(row):
-    """Returns (period, ratio) for whichever MA period gives the HIGHEST
-    volume ratio (for logging), regardless of whether it clears the
-    threshold -- use _rvol_ok() for the pass/fail check."""
     best_period, best_ratio = None, 0.0
     for p in VOL_MA_PERIODS:
         ma = row.get(f"vol_ma_{p}")
@@ -248,12 +238,6 @@ def _rvol_ok(row) -> bool:
     return best_ratio >= VOL_MULTIPLIER
 
 
-def _macd_detail(row) -> str:
-    diff = row["macd"] - row["macd_signal"]
-    state = "above" if diff > 0 else "below"
-    return f"MACD {state} signal (macd={row['macd']:.6f}, signal={row['macd_signal']:.6f}, diff={diff:.6f})"
-
-
 def _trend_ok(row) -> bool:
     return row["ema9"] > row["ema20"] > row["vwap"] > row["ema200"]
 
@@ -266,15 +250,14 @@ def _avg_vol(cands):
     return sum(c["volume"] for c in cands) / len(cands) if cands else 0
 
 
-def _breakout_confirmed(row, pullback_first_high, prev_volume) -> bool:
-    """A breakout fires the instant price crosses the pullback's first red
-    candle's high (wick included), with volume showing at least some
-    increase vs. the immediately preceding candle -- checked live on the
-    still-forming candle too (not just after it closes), so entry doesn't
-    lag behind the actual breakout."""
-    if row["high"] <= pullback_first_high:
+def _breakout_confirmed(high, volume, pullback_first_high, prev_volume) -> bool:
+    """Fires the instant price crosses the pullback's first red candle's
+    high (wick included), with volume showing at least some increase vs.
+    the immediately preceding candle. Takes plain values (not a pandas row)
+    so it can be called cheaply on every live WebSocket tick."""
+    if high <= pullback_first_high:
         return False
-    if prev_volume is not None and row["volume"] < prev_volume:
+    if prev_volume is not None and volume < prev_volume:
         return False
     return True
 
@@ -291,36 +274,39 @@ def _entry_detail(row) -> dict:
 
 
 # ----------------------------- WAVE STATE MACHINE --------------------------
-def analyze_symbol(df: pd.DataFrame):
+def run_state_machine(df: pd.DataFrame):
     """
-    Rebuilds the whole rally/pullback/breakout sequence from the fetched
-    candle window every time (stateless across restarts -- safe for
-    redeploys). Returns ("rally2"|"rally3", entry_price) if a fresh ENTRY
-    happened on the most recently CLOSED candle, else None.
+    Rebuilds the whole rally/pullback/breakout sequence from CLOSED candles
+    only (the newest row in df is assumed already closed -- this is called
+    right after a candle-close event, never on a live/forming candle).
+
+    Returns (entry_or_None, watch_state_or_None):
+      entry: (stage, price, candle_key, detail) if a breakout completed
+              exactly on the newest closed candle.
+      watch_state: {"pullback_first_high":, "prev_volume":, "stage":} if the
+              state machine ended in WATCH_BREAKOUT (waiting for a breakout),
+              so the caller can cheaply check future live ticks against it.
     """
     n = len(df)
     if n < 210:
-        return None
+        return None, None
 
-    last_closed_idx = n - 2  # -1 may be a live/incomplete candle
-    start_idx = 200          # need EMA200 to be meaningful
+    last_idx = n - 1
+    start_idx = max(0, n - 260)
 
     phase = "WAIT_RALLY1"
-    rally_candles = []          # current rally's candles (rally1 or rally2, reused)
+    rally_candles = []
     rally_range = None
     pullback_candles = []
     pullback_first_high = None
-    watch_candles = []          # green candles being watched for breakout
-    stage_after_pullback = None  # "rally2" or "rally3" -- which breakout we're watching for
+    watch_candles = []
+    stage_after_pullback = None
     entry_index = None
     entry_stage = None
     entry_price = None
     entry_detail = None
 
-    def avg_vol(cands):
-        return _avg_vol(cands)
-
-    for i in range(start_idx, last_closed_idx + 1):
+    for i in range(start_idx, last_idx + 1):
         row = df.iloc[i]
         is_green = row["close"] > row["open"]
         is_red = row["close"] < row["open"]
@@ -329,7 +315,7 @@ def analyze_symbol(df: pd.DataFrame):
         if phase == "WAIT_RALLY1":
             if is_green and body_pct >= RALLY_MIN_BODY_PCT:
                 if rally_candles and row["volume"] < rally_candles[-1]["volume"]:
-                    rally_candles = [row]  # volume dipped, restart the count
+                    rally_candles = [row]
                 else:
                     rally_candles.append(row)
                 if len(rally_candles) >= 2 and _trend_ok(row) and _rvol_ok(row) and _macd_ok(row):
@@ -346,26 +332,19 @@ def analyze_symbol(df: pd.DataFrame):
                 r_high, r_low = rally_range[1], rally_range[0]
                 r_size = r_high - r_low
                 retrace = r_high - row["low"]
-                rally_avg_vol = avg_vol(rally_candles)
+                rally_avg_vol = _avg_vol(rally_candles)
                 too_deep = r_size > 0 and (retrace / r_size) >= INVALIDATION_RETRACE_PCT
-                # Pullback volume must stay clearly BELOW the rally's own volume --
-                # if a pullback candle's volume gets too close to (or exceeds) the
-                # rally's volume, sellers are just as strong as buyers were, which
-                # contradicts a genuine "weak pullback".
                 too_heavy = rally_avg_vol > 0 and row["volume"] > PULLBACK_MAX_VOL_RATIO * rally_avg_vol
                 if too_deep or too_heavy:
                     phase = "WAIT_RALLY1"
                     rally_candles = []
             elif is_green:
                 if not pullback_candles:
-                    rally_candles.append(row)  # rally just extended, no pullback yet
+                    rally_candles.append(row)
                 else:
                     pullback_first_high = pullback_candles[0]["high"]
                     watch_candles = [row]
-                    # Check THIS candle for breakout too -- it may already cross
-                    # the pullback high (previously only later candles were
-                    # checked, which meant an immediate breakout was missed).
-                    if _breakout_confirmed(row, pullback_first_high, pullback_candles[-1]["volume"]):
+                    if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, pullback_candles[-1]["volume"]):
                         entry_index = i
                         entry_stage = stage_after_pullback
                         entry_price = row["close"]
@@ -386,13 +365,12 @@ def analyze_symbol(df: pd.DataFrame):
             if is_green:
                 prev_vol = watch_candles[-1]["volume"] if watch_candles else pullback_candles[-1]["volume"]
                 watch_candles.append(row)
-                if _breakout_confirmed(row, pullback_first_high, prev_vol):
+                if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, prev_vol):
                     entry_index = i
                     entry_stage = stage_after_pullback
                     entry_price = row["close"]
                     entry_detail = _entry_detail(row)
                     if stage_after_pullback == "rally2":
-                        # allow one more cycle (rally 3) before fully resetting
                         rally_range = (min(c["low"] for c in watch_candles), max(c["high"] for c in watch_candles))
                         rally_candles = list(watch_candles)
                         phase = "PULLBACK"
@@ -408,36 +386,26 @@ def analyze_symbol(df: pd.DataFrame):
                 phase = "WAIT_RALLY1"
                 rally_candles = []
 
-    if entry_index == last_closed_idx:
-        candle_key = df.iloc[last_closed_idx]["open_time"]
-        return entry_stage, entry_price, candle_key, entry_detail
+    entry_result = None
+    if entry_index == last_idx:
+        candle_key = df.iloc[last_idx]["open_time"]
+        entry_result = (entry_stage, entry_price, candle_key, entry_detail)
 
-    # No breakout found in fully-closed candles -- also check the LIVE
-    # (still-forming) candle. Waiting for a candle to fully close before
-    # reacting means entries land several minutes late, often at a much
-    # worse price than the actual breakout. If we're currently watching
-    # for a breakout and the live candle has already crossed the level,
-    # enter now instead of waiting up to 5 more minutes.
-    if phase == "WATCH_BREAKOUT" and n >= 1:
-        live = df.iloc[-1]
+    watch_state = None
+    if phase == "WATCH_BREAKOUT":
         prev_vol = watch_candles[-1]["volume"] if watch_candles else pullback_candles[-1]["volume"]
-        if _breakout_confirmed(live, pullback_first_high, prev_vol):
-            candle_key = live["open_time"]
-            return stage_after_pullback, live["close"], candle_key, _entry_detail(live)
+        watch_state = {
+            "pullback_first_high": pullback_first_high,
+            "prev_volume": prev_vol,
+            "stage": stage_after_pullback,
+        }
 
-    return None
+    return entry_result, watch_state
 
 
-def check_exit(df: pd.DataFrame) -> bool:
-    """
-    Exit rule: ride the green rally you entered on, and get out the moment
-    the FIRST red (pullback) candle appears after it -- take whatever
-    profit built up during the green run. Applies the same way whether the
-    open position came from a rally2 or rally3 entry.
-    """
-    if len(df) < 3:
-        return False
-    row = df.iloc[-2]  # last CLOSED candle
+def check_exit_row(row) -> bool:
+    """Exit rule: get out the moment the first red candle appears right
+    after the rally you entered on. `row` is the newest CLOSED candle."""
     return row["close"] < row["open"]
 
 
@@ -522,7 +490,7 @@ def close_all_for_symbol(symbol: str):
         cost_basis = pos["qty"] * pos["entry_price"]
         gross_pnl = quote_received - cost_basis
         total_fees = pos.get("entry_fee", 0) + exit_fee
-        pnl = gross_pnl - total_fees  # net of Binance's standard 0.1%-per-side fee
+        pnl = gross_pnl - total_fees
         _realized_pnl_total += pnl
         hold_minutes = (time.time() - pos["entry_time"]) / 60
         log.info(
@@ -536,8 +504,8 @@ def close_all_for_symbol(symbol: str):
 
 def log_portfolio_summary():
     if not _open_positions:
-        log.info("PORTFOLIO: no open positions | %d/%d slots used | realized net PnL (fees included): %.2f USDT",
-                  0, MAX_CONCURRENT_TRADES, _realized_pnl_total)
+        log.info("PORTFOLIO: no open positions | 0/%d slots used | realized net PnL (fees included): %.2f USDT",
+                  MAX_CONCURRENT_TRADES, _realized_pnl_total)
         return
     lines = []
     for s, positions in _open_positions.items():
@@ -549,82 +517,215 @@ def log_portfolio_summary():
     )
 
 
-# ----------------------------- MAIN LOOP ----------------------------------
-def process_symbol(symbol: str, df, tradeable: bool):
-    df = add_indicators(df)
-
-    result = analyze_symbol(df)
-    if result:
-        stage, price, candle_key, detail = result
-        if not _entry_already_taken(symbol, stage, candle_key):
-            _mark_entry_taken(symbol, stage, candle_key)
-            tag = "ðŸŸ¢ SPOT" if tradeable else "ðŸŸ¡ ALPHA (manual only)"
-            msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m"
-            log.info(
-                "SIGNAL: %s | RVOL=%.2fx (vs %s-period MA) | MACD %s signal (macd=%.6f, signal=%.6f)",
-                msg.replace(chr(10), " | "), detail["rvol_ratio"], detail["rvol_period"],
-                "above" if detail["macd_above_signal"] else "below", detail["macd"], detail["macd_signal"]
-            )
-            send_telegram(msg)
-            if tradeable and ENABLE_TRADING:
-                open_long(symbol, stage, detail)
-
-    if tradeable and symbol in _open_positions and check_exit(df):
-        close_all_for_symbol(symbol)
+# ----------------------------- PER-SYMBOL STATE ----------------------------
+# symbol -> {"df": DataFrame (with indicators), "tradeable": bool, "watch": dict or None}
+_symbol_state = {}
+_alpha_symbol_to_name = {}  # "ALPHA_116USDT" -> "TOKEN" (human name for logs/telegram)
 
 
-def scan_once():
-    _prune_old_entries()
-    spot_symbols = get_usdt_symbols()
-    alpha_tokens = get_alpha_tokens()
-    log.info("Scanning %d spot pairs + %d Alpha tokens...", len(spot_symbols), len(alpha_tokens))
-
-    for symbol in spot_symbols:
-        try:
-            df = get_spot_klines(symbol)
-            if df is not None:
-                process_symbol(symbol, df, tradeable=True)
-        except Exception as e:
-            log.warning("Error processing spot %s: %s", symbol, e)
-        time.sleep(0.12)
-
-    for token in alpha_tokens:
-        try:
-            df = get_alpha_klines(token["alpha_symbol"])
-            if df is not None:
-                process_symbol(token["name"], df, tradeable=False)
-        except Exception as e:
-            log.warning("Error processing alpha %s: %s", token["alpha_symbol"], e)
-        time.sleep(0.12)
-
-
-def main():
+def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
+    stage, price, candle_key, detail = entry_result
+    if _entry_already_taken(symbol, stage, candle_key):
+        return
+    _mark_entry_taken(symbol, stage, candle_key)
+    tag = "ðŸŸ¢ SPOT" if tradeable else "ðŸŸ¡ ALPHA (manual only)"
+    msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m"
     log.info(
-        "Wave bot starting. Telegram: %s | Trading: %s | Budget: $%d ($%d/trade, max %d concurrent)",
+        "SIGNAL: %s | RVOL=%.2fx (vs %s-period MA) | MACD %s signal (macd=%.6f, signal=%.6f)",
+        msg.replace(chr(10), " | "), detail["rvol_ratio"], detail["rvol_period"],
+        "above" if detail["macd_above_signal"] else "below", detail["macd"], detail["macd_signal"]
+    )
+    send_telegram(msg)
+    if tradeable and ENABLE_TRADING:
+        open_long(symbol, stage, detail)
+
+
+def seed_symbol(symbol: str, tradeable: bool):
+    df = get_spot_klines(symbol) if tradeable else get_alpha_klines(symbol)
+    if df is None:
+        return
+    df = add_indicators(df)
+    # Compute initial state silently -- don't act on whatever the state
+    # machine finds in old history, only store it so live ticks going
+    # forward can react to genuinely NEW breakouts.
+    _, watch_state = run_state_machine(df)
+    _symbol_state[symbol] = {"df": df, "tradeable": tradeable, "watch": watch_state}
+
+
+def seed_all_symbols(spot_symbols, alpha_tokens):
+    log.info("Seeding history for %d spot pairs + %d Alpha tokens (parallelized)...",
+              len(spot_symbols), len(alpha_tokens))
+    _alpha_symbol_to_name.clear()
+    for t in alpha_tokens:
+        _alpha_symbol_to_name[t["alpha_symbol"].upper()] = t["name"]
+
+    with ThreadPoolExecutor(max_workers=SEED_WORKERS) as ex:
+        futures = [ex.submit(seed_symbol, s, True) for s in spot_symbols]
+        futures += [ex.submit(seed_symbol, t["name"], False) for t in alpha_tokens]
+        for f in futures:
+            try:
+                f.result(timeout=30)
+            except Exception as e:
+                log.warning("Seed error: %s", e)
+    log.info("Seeding complete. %d symbols loaded.", len(_symbol_state))
+
+
+def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
+    state = _symbol_state.get(symbol)
+    if state is None:
+        return  # not seeded (shouldn't normally happen)
+    df = state["df"]
+    new_row = pd.DataFrame([{
+        "open_time": open_time, "open": o, "high": h, "low": l, "close": c,
+        "volume": v, "close_time": close_time, "quote_asset_volume": 0,
+        "num_trades": 0, "taker_buy_base": 0, "taker_buy_quote": 0, "ignore": 0,
+    }])
+    # Replace the last row if it's the SAME candle (shouldn't be, since this
+    # is only called on closed candles), otherwise append and trim.
+    df = pd.concat([df[["open_time", "open", "high", "low", "close", "volume",
+                        "close_time", "quote_asset_volume", "num_trades",
+                        "taker_buy_base", "taker_buy_quote", "ignore"]], new_row], ignore_index=True)
+    if len(df) > MAX_HISTORY_ROWS:
+        df = df.iloc[-MAX_HISTORY_ROWS:].reset_index(drop=True)
+    df = add_indicators(df)
+    state["df"] = df
+
+    entry_result, watch_state = run_state_machine(df)
+    state["watch"] = watch_state
+    if entry_result:
+        _signal_and_maybe_trade(symbol, state["tradeable"], entry_result)
+
+    if state["tradeable"] and symbol in _open_positions:
+        last_row = df.iloc[-1]
+        if check_exit_row(last_row):
+            close_all_for_symbol(symbol)
+
+
+def on_live_tick(symbol: str, high: float, close: float, volume: float, open_time):
+    state = _symbol_state.get(symbol)
+    if state is None:
+        return
+    watch = state.get("watch")
+    if not watch:
+        return
+    if _breakout_confirmed(high, volume, watch["pullback_first_high"], watch["prev_volume"]):
+        candle_key = open_time
+        stage = watch["stage"]
+        if _entry_already_taken(symbol, stage, candle_key):
+            return
+        # Build a lightweight detail dict from the last known closed-candle
+        # indicators (good enough for logging -- indicators don't move much
+        # within one 5m candle).
+        last_closed = state["df"].iloc[-1]
+        detail = _entry_detail(last_closed)
+        _mark_entry_taken(symbol, stage, candle_key)
+        tag = "ðŸŸ¢ SPOT" if state["tradeable"] else "ðŸŸ¡ ALPHA (manual only)"
+        msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout (live)\nPrice: {close:.6f}\nTimeframe: 5m"
+        log.info(
+            "SIGNAL (live): %s | RVOL=%.2fx (vs %s-period MA) | MACD %s signal (macd=%.6f, signal=%.6f)",
+            msg.replace(chr(10), " | "), detail["rvol_ratio"], detail["rvol_period"],
+            "above" if detail["macd_above_signal"] else "below", detail["macd"], detail["macd_signal"]
+        )
+        send_telegram(msg)
+        if state["tradeable"] and ENABLE_TRADING:
+            open_long(symbol, stage, detail)
+        # Clear the watch so we don't refire every tick until the candle
+        # closes and the state machine naturally rebuilds (possibly into
+        # rally3 pullback-tracking).
+        state["watch"] = None
+
+
+# ----------------------------- WEBSOCKET LOOPS -----------------------------
+async def _subscribe_all(ws, stream_names):
+    for i in range(0, len(stream_names), STREAMS_PER_SUBSCRIBE):
+        batch = stream_names[i:i + STREAMS_PER_SUBSCRIBE]
+        await ws.send(json.dumps({"method": "SUBSCRIBE", "params": batch, "id": i + 1}))
+        await asyncio.sleep(0.2)
+
+
+async def spot_ws_loop(spot_symbols):
+    streams = [f"{s.lower()}@kline_{KLINE_INTERVAL}" for s in spot_symbols]
+    async with websockets.connect("wss://stream.binance.com:9443/stream", ping_interval=20, ping_timeout=60, max_size=None) as ws:
+        await _subscribe_all(ws, streams)
+        log.info("Spot WebSocket connected and subscribed to %d streams.", len(streams))
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+                data = msg.get("data", msg)
+                if data.get("e") != "kline":
+                    continue
+                symbol = data["s"]
+                k = data["k"]
+                o, h, l, c, v = float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])
+                if k["x"]:
+                    on_candle_close(symbol, o, h, l, c, v, k["t"], k["T"])
+                else:
+                    on_live_tick(symbol, h, c, v, k["t"])
+            except Exception as e:
+                log.warning("Spot WS message error: %s", e)
+
+
+async def alpha_ws_loop(alpha_tokens):
+    streams = [f"{t['alpha_symbol'].lower()}@kline_{KLINE_INTERVAL}" for t in alpha_tokens]
+    async with websockets.connect(ALPHA_WS_BASE, ping_interval=20, ping_timeout=60, max_size=None) as ws:
+        await _subscribe_all(ws, streams)
+        log.info("Alpha WebSocket connected and subscribed to %d streams.", len(streams))
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+                data = msg.get("data", msg)
+                if data.get("e") != "kline":
+                    continue
+                alpha_symbol = data["s"].upper()
+                name = _alpha_symbol_to_name.get(alpha_symbol, alpha_symbol)
+                k = data["k"]
+                o, h, l, c, v = float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])
+                if k["x"]:
+                    on_candle_close(name, o, h, l, c, v, k["t"], k["T"])
+                else:
+                    on_live_tick(name, h, c, v, k["t"])
+            except Exception as e:
+                log.warning("Alpha WS message error: %s", e)
+
+
+async def periodic_tasks(duration_seconds):
+    """Logs a heartbeat/portfolio summary every minute; returns (letting the
+    caller trigger a full reseed+reconnect) after `duration_seconds`."""
+    elapsed = 0
+    while elapsed < duration_seconds:
+        await asyncio.sleep(60)
+        elapsed += 60
+        _prune_old_entries()
+        log_portfolio_summary()
+
+
+async def run_bot_cycle():
+    loop = asyncio.get_event_loop()
+    spot_symbols = await loop.run_in_executor(None, get_usdt_symbols)
+    alpha_tokens = await loop.run_in_executor(None, get_alpha_tokens)
+    await loop.run_in_executor(None, seed_all_symbols, spot_symbols, alpha_tokens)
+
+    log.info(
+        "Wave bot (real-time) starting. Telegram: %s | Trading: %s | Budget: $%d ($%d/trade, max %d concurrent)",
         bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID), ENABLE_TRADING,
         ACCOUNT_BUDGET_USDT, TRADE_SIZE_USDT, MAX_CONCURRENT_TRADES
     )
-    send_telegram("âœ… Wave strategy bot is online (Spot + Alpha scanning).")
-    executor = ThreadPoolExecutor(max_workers=1)
+    send_telegram("âœ… Wave strategy bot is online (real-time WebSocket, Spot + Alpha).")
+
+    await asyncio.gather(
+        spot_ws_loop(spot_symbols),
+        alpha_ws_loop(alpha_tokens),
+        periodic_tasks(SYMBOL_REFRESH_SECONDS),
+    )
+
+
+def main():
     while True:
-        start = time.time()
         try:
-            future = executor.submit(scan_once)
-            future.result(timeout=SCAN_CYCLE_TIMEOUT_SECONDS)
-        except FutureTimeoutError:
-            log.error(
-                "Scan cycle exceeded %ds and appears stuck -- abandoning it and "
-                "starting a fresh cycle (the stuck one is left to die in the background).",
-                SCAN_CYCLE_TIMEOUT_SECONDS
-            )
-            executor = ThreadPoolExecutor(max_workers=1)  # fresh worker, old one abandoned
+            asyncio.run(run_bot_cycle())
         except Exception as e:
-            log.error("Scan cycle failed: %s", e)
-        log_portfolio_summary()
-        elapsed = time.time() - start
-        sleep_for = max(5, SCAN_INTERVAL_SECONDS - elapsed)
-        log.info("Cycle done in %.1fs, sleeping %.1fs", elapsed, sleep_for)
-        time.sleep(sleep_for)
+            log.error("Bot cycle ended/crashed: %s -- doing a full fresh reseed+reconnect in 10s", e)
+        time.sleep(10)
 
 
 if __name__ == "__main__":
