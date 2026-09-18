@@ -1,4 +1,4 @@
- """
+"""
 Binance Wave Strategy Bot -- REAL-TIME (WebSocket) edition
 -------------------------------------------------------------
 Spot + Alpha scanning, Spot demo trading on Binance Testnet.
