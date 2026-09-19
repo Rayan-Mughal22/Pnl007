@@ -574,6 +574,16 @@ def _run_bg(fn, *args):
         fn(*args)  # no running loop (shouldn't happen) -- fall back to direct call
 
 
+# All 5m candles across every symbol close at the same wall-clock moment, so
+# on every candle-close boundary, hundreds of on_candle_close() calls arrive
+# in a burst. Each does real CPU work (pandas concat + full indicator
+# recompute), so running them one-by-one on the event loop thread would
+# stall it (and, given enough symbols, cause a growing backlog that never
+# catches up -- this is what caused the earlier multi-hour hangs). A
+# dedicated thread pool lets these run concurrently instead.
+_CANDLE_EXECUTOR = ThreadPoolExecutor(max_workers=32)
+
+
 def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
     stage, price, candle_key, detail = entry_result
     if _entry_already_taken(symbol, stage, candle_key):
@@ -733,7 +743,13 @@ async def spot_ws_loop(spot_symbols):
                 k = data["k"]
                 o, h, l, c, v = float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])
                 if k["x"]:
-                    on_candle_close(symbol, o, h, l, c, v, k["t"], k["T"])
+                    # All 5m candles across every symbol close at the SAME
+                    # wall-clock moment, so hundreds of these can arrive at
+                    # once. The pandas/indicator recompute per symbol is real
+                    # CPU work -- doing it directly here would stall the
+                    # event loop (and eventually the whole connection) under
+                    # that burst. Offload to the candle-close thread pool.
+                    _CANDLE_EXECUTOR.submit(on_candle_close, symbol, o, h, l, c, v, k["t"], k["T"])
                 else:
                     on_live_tick(symbol, h, c, v, k["t"])
             except Exception as e:
@@ -756,7 +772,7 @@ async def alpha_ws_loop(alpha_tokens):
                 k = data["k"]
                 o, h, l, c, v = float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])
                 if k["x"]:
-                    on_candle_close(name, o, h, l, c, v, k["t"], k["T"])
+                    _CANDLE_EXECUTOR.submit(on_candle_close, name, o, h, l, c, v, k["t"], k["T"])
                 else:
                     on_live_tick(name, h, c, v, k["t"])
             except Exception as e:
@@ -804,4 +820,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()        
+    main()                              
