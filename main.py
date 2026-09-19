@@ -50,6 +50,7 @@ import hmac
 import hashlib
 import logging
 import asyncio
+import resource
 import requests
 import pandas as pd
 import numpy as np
@@ -81,7 +82,6 @@ MAX_HISTORY_ROWS = 300           # trimmed window kept per symbol after seeding
 SEED_WORKERS = 24                # parallel REST calls during startup seeding
 SYMBOL_REFRESH_SECONDS = 3600    # re-seed + reconnect hourly to pick up new/delisted symbols
 STREAMS_PER_SUBSCRIBE = 200      # batch size for SUBSCRIBE messages
-DAILY_BREAKOUT_LOOKBACK_DAYS = 10  # entries also require price above the highest daily high of the last N days
 
 VOL_MA_PERIODS = [10, 20, 30, 50]
 VOL_MULTIPLIER = 1.0             # RVOL threshold vs. ANY ONE of the MA periods above
@@ -182,44 +182,6 @@ def get_spot_klines(symbol: str):
     return _parse_klines(r.json())
 
 
-def get_spot_daily_high(symbol: str, lookback_days: int = DAILY_BREAKOUT_LOOKBACK_DAYS):
-    """Highest daily HIGH over the last `lookback_days` FULLY CLOSED daily
-    candles (today's still-forming candle is excluded)."""
-    params = {"symbol": symbol, "interval": "1d", "limit": lookback_days + 1}
-    try:
-        r = requests.get(f"{BINANCE_BASE}/api/v3/klines", params=params, timeout=10)
-        if r.status_code != 200:
-            return None
-        raw = r.json()
-        if len(raw) < 2:
-            return None
-        closed = raw[:-1]  # drop today's still-forming candle
-        return max(float(c[2]) for c in closed)  # index 2 = high
-    except Exception as e:
-        log.warning("Failed to fetch daily high for %s: %s", symbol, e)
-        return None
-
-
-def get_alpha_daily_high(alpha_symbol: str, lookback_days: int = DAILY_BREAKOUT_LOOKBACK_DAYS):
-    url = f"{ALPHA_BASE}/bapi/defi/v1/public/alpha-trade/klines"
-    params = {"symbol": alpha_symbol, "interval": "1d", "limit": lookback_days + 1}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not data.get("success"):
-            return None
-        raw = data.get("data", [])
-        if len(raw) < 2:
-            return None
-        closed = raw[:-1]
-        return max(float(c[2]) for c in closed)
-    except Exception as e:
-        log.warning("Failed to fetch Alpha daily high for %s: %s", alpha_symbol, e)
-        return None
-
-
 def get_alpha_klines(alpha_symbol: str):
     url = f"{ALPHA_BASE}/bapi/defi/v1/public/alpha-trade/klines"
     params = {"symbol": alpha_symbol, "interval": KLINE_INTERVAL, "limit": KLINE_LIMIT}
@@ -278,7 +240,10 @@ def _rvol_ok(row) -> bool:
 
 
 def _trend_ok(row) -> bool:
-    return row["ema9"] > row["ema20"] > row["vwap"] > row["ema200"]
+    # Ross Cameron's trend filter is simply "above EMA20" -- the earlier
+    # 4-way EMA9>EMA20>VWAP>EMA200 stack was far stricter than his actual
+    # criteria and was likely why so few trades were firing.
+    return row["close"] > row["ema20"] and row["ema9"] > row["ema20"]
 
 
 def _macd_ok(row) -> bool:
@@ -448,6 +413,48 @@ def check_exit_row(row) -> bool:
     return row["close"] < row["open"]
 
 
+# ----------------------------- ROSS CAMERON: ADDITIONAL SETUPS -------------
+# Warrior Trading's actual method isn't just one pattern -- Bull Flag (above),
+# VWAP Bounce, and a High-Of-Day-style breakout are three of his core,
+# distinct setups. Having only the Bull Flag state machine (which needs a
+# fairly specific multi-candle sequence) was too restrictive -- these two
+# simpler, independent setups give more legitimate entry opportunities
+# without loosening quality, since each still requires trend + RVOL.
+NEW_HIGH_LOOKBACK_CANDLES = 24    # ~2 hours on 5m candles -- crypto's 24/7 analogue to "High of Day"
+VWAP_BOUNCE_VOL_MULT = 1.3        # bounce candle's volume must beat the prior (VWAP-touch) candle by this much
+VWAP_TOUCH_TOLERANCE = 0.002      # how close to VWAP counts as "touched" (0.2%)
+
+
+def check_new_high_breakout(df: pd.DataFrame):
+    """Ross's 'High of Day' continuation play, adapted for a 24/7 market:
+    price breaks above the highest high of the last N candles, on rising
+    volume, while trend holds."""
+    if len(df) < NEW_HIGH_LOOKBACK_CANDLES + 2:
+        return None
+    row = df.iloc[-1]
+    window = df.iloc[-(NEW_HIGH_LOOKBACK_CANDLES + 1):-1]
+    prior_high = window["high"].max()
+    is_green = row["close"] > row["open"]
+    if is_green and row["high"] > prior_high and _rvol_ok(row) and _trend_ok(row) and _macd_ok(row):
+        return "hod_breakout", row["close"], row["open_time"], _entry_detail(row)
+    return None
+
+
+def check_vwap_bounce(df: pd.DataFrame):
+    """Ross's VWAP Bounce: price pulls back to touch/near VWAP, then bounces
+    -- closes back above VWAP on a green candle with a pickup in volume."""
+    if len(df) < 5:
+        return None
+    prev, row = df.iloc[-2], df.iloc[-1]
+    touched_vwap = prev["low"] <= prev["vwap"] * (1 + VWAP_TOUCH_TOLERANCE)
+    is_green = row["close"] > row["open"]
+    bounced_above = row["close"] > row["vwap"]
+    vol_ok = row["volume"] >= VWAP_BOUNCE_VOL_MULT * prev["volume"]
+    if touched_vwap and is_green and bounced_above and vol_ok and _trend_ok(row) and _macd_ok(row):
+        return "vwap_bounce", row["close"], row["open_time"], _entry_detail(row)
+    return None
+
+
 # ----------------------------- TESTNET TRADING ----------------------------
 def _signed_request(method: str, path: str, params: dict):
     if not TESTNET_API_KEY or not TESTNET_API_SECRET:
@@ -584,6 +591,17 @@ def _run_bg(fn, *args):
 _CANDLE_EXECUTOR = ThreadPoolExecutor(max_workers=32)
 
 
+def _submit_candle_close(*args):
+    future = _CANDLE_EXECUTOR.submit(on_candle_close, *args)
+
+    def _log_if_failed(f):
+        exc = f.exception()
+        if exc:
+            log.error("on_candle_close crashed for args=%s: %r", args[:1], exc)
+
+    future.add_done_callback(_log_if_failed)
+
+
 def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
     stage, price, candle_key, detail = entry_result
     if _entry_already_taken(symbol, stage, candle_key):
@@ -601,16 +619,6 @@ def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
         open_long(symbol, stage, detail)
 
 
-_daily_high_cache = {}  # symbol/name -> highest daily high over the lookback window
-
-
-def _daily_breakout_ok(symbol: str, price: float) -> bool:
-    daily_high = _daily_high_cache.get(symbol)
-    if daily_high is None:
-        return True  # don't block trades just because we don't have this data yet
-    return price > daily_high
-
-
 def seed_symbol(key: str, tradeable: bool, fetch_symbol: str = None):
     fetch_symbol = fetch_symbol or key
     df = get_spot_klines(fetch_symbol) if tradeable else get_alpha_klines(fetch_symbol)
@@ -622,10 +630,6 @@ def seed_symbol(key: str, tradeable: bool, fetch_symbol: str = None):
     # forward can react to genuinely NEW breakouts.
     _, watch_state = run_state_machine(df)
     _symbol_state[key] = {"df": df, "tradeable": tradeable, "watch": watch_state}
-
-    daily_high = get_spot_daily_high(fetch_symbol) if tradeable else get_alpha_daily_high(fetch_symbol)
-    if daily_high is not None:
-        _daily_high_cache[key] = daily_high
 
 
 def seed_all_symbols(spot_symbols, alpha_tokens):
@@ -643,8 +647,7 @@ def seed_all_symbols(spot_symbols, alpha_tokens):
                 f.result(timeout=30)
             except Exception as e:
                 log.warning("Seed error: %s", e)
-    log.info("Seeding complete. %d symbols loaded, %d with daily-high data.",
-              len(_symbol_state), len(_daily_high_cache))
+    log.info("Seeding complete. %d symbols loaded.", len(_symbol_state))
 
 
 def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
@@ -669,13 +672,13 @@ def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
 
     entry_result, watch_state = run_state_machine(df)
     state["watch"] = watch_state
-    if entry_result:
-        stage, price, candle_key, detail = entry_result
-        if _daily_breakout_ok(symbol, price):
-            _run_bg(_signal_and_maybe_trade, symbol, state["tradeable"], entry_result)
-        else:
-            log.info("Skipping %s [%s]: price %.6f hasn't broken the %d-day high too (5m setup alone isn't enough).",
-                      symbol, stage, price, DAILY_BREAKOUT_LOOKBACK_DAYS)
+
+    # Check all three Ross Cameron setups independently -- any one firing
+    # is a valid entry. Each is dedup-guarded by its own (symbol, stage,
+    # candle) key, so they never double-fire the same setup twice.
+    for result in (entry_result, check_new_high_breakout(df), check_vwap_bounce(df)):
+        if result:
+            _run_bg(_signal_and_maybe_trade, symbol, state["tradeable"], result)
 
     if state["tradeable"] and symbol in _open_positions:
         last_row = df.iloc[-1]
@@ -694,8 +697,6 @@ def on_live_tick(symbol: str, high: float, close: float, volume: float, open_tim
         candle_key = open_time
         stage = watch["stage"]
         if _entry_already_taken(symbol, stage, candle_key):
-            return
-        if not _daily_breakout_ok(symbol, close):
             return
         # Build a lightweight detail dict from the last known closed-candle
         # indicators (good enough for logging -- indicators don't move much
@@ -749,7 +750,7 @@ async def spot_ws_loop(spot_symbols):
                     # CPU work -- doing it directly here would stall the
                     # event loop (and eventually the whole connection) under
                     # that burst. Offload to the candle-close thread pool.
-                    _CANDLE_EXECUTOR.submit(on_candle_close, symbol, o, h, l, c, v, k["t"], k["T"])
+                    _submit_candle_close(symbol, o, h, l, c, v, k["t"], k["T"])
                 else:
                     on_live_tick(symbol, h, c, v, k["t"])
             except Exception as e:
@@ -772,7 +773,7 @@ async def alpha_ws_loop(alpha_tokens):
                 k = data["k"]
                 o, h, l, c, v = float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])
                 if k["x"]:
-                    _CANDLE_EXECUTOR.submit(on_candle_close, name, o, h, l, c, v, k["t"], k["T"])
+                    _submit_candle_close(name, o, h, l, c, v, k["t"], k["T"])
                 else:
                     on_live_tick(name, h, c, v, k["t"])
             except Exception as e:
@@ -788,6 +789,10 @@ async def periodic_tasks(duration_seconds):
         elapsed += 60
         _prune_old_entries()
         log_portfolio_summary()
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        pending = _CANDLE_EXECUTOR._work_queue.qsize()
+        log.info("HEALTH: memory=%.1fMB | symbols_tracked=%d | candle-close queue backlog=%d | dedup_cache=%d",
+                  mem_mb, len(_symbol_state), pending, len(_entries_taken))
 
 
 async def run_bot_cycle():
@@ -820,4 +825,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()                              
+    main()
