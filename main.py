@@ -51,6 +51,7 @@ import hashlib
 import logging
 import asyncio
 import resource
+import threading
 import requests
 import pandas as pd
 import numpy as np
@@ -251,14 +252,36 @@ def _avg_vol(cands):
     return sum(c["volume"] for c in cands) / len(cands) if cands else 0
 
 
-def _breakout_confirmed(high, volume, pullback_first_high, prev_volume) -> bool:
+def _row_vol_ma_lookup(row) -> dict:
+    return {p: row.get(f"vol_ma_{p}") for p in VOL_MA_PERIODS}
+
+
+def _rvol_ok_against(volume, vol_ma_lookup) -> bool:
+    """Same 'RVOL >= 1x vs ANY ONE of the 10/20/30/50-period MAs' check as
+    _rvol_ok, but works off plain values so it's usable on live ticks too
+    (where we don't have a fresh pandas row, just the latest closed
+    candle's already-computed MA values as the reference)."""
+    if not vol_ma_lookup:
+        return False
+    for p in VOL_MA_PERIODS:
+        ma = vol_ma_lookup.get(p)
+        if ma and ma > 0 and volume / ma >= VOL_MULTIPLIER:
+            return True
+    return False
+
+
+def _breakout_confirmed(high, volume, pullback_first_high, prev_volume, vol_ma_lookup=None) -> bool:
     """Fires the instant price crosses the pullback's first red candle's
     high (wick included), with volume showing at least some increase vs.
-    the immediately preceding candle. Takes plain values (not a pandas row)
-    so it can be called cheaply on every live WebSocket tick."""
+    the immediately preceding candle, AND RVOL >= 1x (same floor as rally1
+    formation, no ceiling -- higher is always fine) at the breakout itself.
+    Takes plain values (not a pandas row) so it can be called cheaply on
+    every live WebSocket tick."""
     if high <= pullback_first_high:
         return False
     if prev_volume is not None and volume < prev_volume:
+        return False
+    if not _rvol_ok_against(volume, vol_ma_lookup):
         return False
     return True
 
@@ -345,7 +368,7 @@ def run_state_machine(df: pd.DataFrame):
                 else:
                     pullback_first_high = pullback_candles[0]["high"]
                     watch_candles = [row]
-                    if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, pullback_candles[-1]["volume"]):
+                    if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, pullback_candles[-1]["volume"], _row_vol_ma_lookup(row)):
                         entry_index = i
                         entry_stage = stage_after_pullback
                         entry_price = row["close"]
@@ -366,7 +389,7 @@ def run_state_machine(df: pd.DataFrame):
             if is_green:
                 prev_vol = watch_candles[-1]["volume"] if watch_candles else pullback_candles[-1]["volume"]
                 watch_candles.append(row)
-                if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, prev_vol):
+                if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, prev_vol, _row_vol_ma_lookup(row)):
                     entry_index = i
                     entry_stage = stage_after_pullback
                     entry_price = row["close"]
@@ -395,10 +418,12 @@ def run_state_machine(df: pd.DataFrame):
     watch_state = None
     if phase == "WATCH_BREAKOUT":
         prev_vol = watch_candles[-1]["volume"] if watch_candles else pullback_candles[-1]["volume"]
+        last_row = watch_candles[-1] if watch_candles else pullback_candles[-1]
         watch_state = {
             "pullback_first_high": pullback_first_high,
             "prev_volume": prev_vol,
             "stage": stage_after_pullback,
+            "vol_ma_lookup": _row_vol_ma_lookup(last_row),
         }
 
     return entry_result, watch_state
@@ -503,19 +528,20 @@ def close_all_for_symbol(symbol: str):
     del _open_positions[symbol]
 
 
-def log_portfolio_summary():
+def log_portfolio_summary(also_telegram: bool = False):
     if not _open_positions:
-        log.info("PORTFOLIO: no open positions | 0/%d slots used | realized net PnL (fees included): %.2f USDT",
-                  MAX_CONCURRENT_TRADES, _realized_pnl_total)
-        return
-    lines = []
-    for s, positions in _open_positions.items():
-        for p in positions:
-            lines.append(f"{s} [{p['stage']}]: qty={p['qty']:.4f} entry={p['entry_price']:.6f}")
-    log.info(
-        "PORTFOLIO: %d/%d slots used | realized net PnL (fees included): %.2f USDT\n  %s",
-        total_open_trades(), MAX_CONCURRENT_TRADES, _realized_pnl_total, "\n  ".join(lines)
-    )
+        msg = (f"PORTFOLIO: no open positions | 0/{MAX_CONCURRENT_TRADES} slots used | "
+               f"realized net PnL (fees included): {_realized_pnl_total:.2f} USDT")
+    else:
+        lines = []
+        for s, positions in _open_positions.items():
+            for p in positions:
+                lines.append(f"{s} [{p['stage']}]: qty={p['qty']:.4f} entry={p['entry_price']:.6f}")
+        msg = (f"PORTFOLIO: {total_open_trades()}/{MAX_CONCURRENT_TRADES} slots used | "
+               f"realized net PnL (fees included): {_realized_pnl_total:.2f} USDT\n  " + "\n  ".join(lines))
+    log.info(msg.replace(chr(10), "\n"))
+    if also_telegram:
+        send_telegram(f"ðŸ“Š Status update\n{msg}")
 
 
 # ----------------------------- PER-SYMBOL STATE ----------------------------
@@ -643,7 +669,7 @@ def on_live_tick(symbol: str, high: float, close: float, volume: float, open_tim
     watch = state.get("watch")
     if not watch:
         return
-    if _breakout_confirmed(high, volume, watch["pullback_first_high"], watch["prev_volume"]):
+    if _breakout_confirmed(high, volume, watch["pullback_first_high"], watch["prev_volume"], watch.get("vol_ma_lookup")):
         candle_key = open_time
         stage = watch["stage"]
         if _entry_already_taken(symbol, stage, candle_key):
@@ -733,16 +759,59 @@ async def alpha_ws_loop(alpha_tokens):
 async def periodic_tasks(duration_seconds):
     """Logs a heartbeat/portfolio summary every minute; returns (letting the
     caller trigger a full reseed+reconnect) after `duration_seconds`."""
+    global _last_heartbeat
     elapsed = 0
+    TELEGRAM_SUMMARY_EVERY_SECONDS = 6 * 3600  # also post the summary to Telegram every 6h
+    since_telegram_summary = 0
     while elapsed < duration_seconds:
         await asyncio.sleep(60)
         elapsed += 60
+        since_telegram_summary += 60
+        _last_heartbeat = time.time()
         _prune_old_entries()
-        log_portfolio_summary()
+        send_to_telegram_too = since_telegram_summary >= TELEGRAM_SUMMARY_EVERY_SECONDS
+        if send_to_telegram_too:
+            since_telegram_summary = 0
+        log_portfolio_summary(also_telegram=send_to_telegram_too)
         mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
         pending = _CANDLE_EXECUTOR._work_queue.qsize()
         log.info("HEALTH: memory=%.1fMB | symbols_tracked=%d | candle-close queue backlog=%d | dedup_cache=%d",
                   mem_mb, len(_symbol_state), pending, len(_entries_taken))
+
+
+# ----------------------------- WATCHDOG ------------------------------------
+# Even after fixing every hang cause found so far, there could always be a
+# not-yet-seen one. Rather than keep chasing causes one at a time, this is
+# an unconditional safety net: if the heartbeat above hasn't updated in
+# WATCHDOG_TIMEOUT_SECONDS, something is stuck badly enough that nothing in
+# this process can be trusted to recover on its own -- so it hard-exits the
+# whole process (os._exit, not a normal exception) and lets Railway restart
+# it completely fresh. This runs on a plain OS thread, independent of
+# asyncio, so it keeps working even if the event loop itself is wedged.
+_last_heartbeat = time.time()
+WATCHDOG_TIMEOUT_SECONDS = 300  # 5 min -- heartbeat is expected every 60s
+
+
+def _watchdog_loop():
+    while True:
+        time.sleep(30)
+        if time.time() - _last_heartbeat > WATCHDOG_TIMEOUT_SECONDS:
+            log.critical(
+                "WATCHDOG: no heartbeat in over %ds -- bot appears stuck. "
+                "Forcing a hard process exit so Railway restarts it fresh.",
+                WATCHDOG_TIMEOUT_SECONDS
+            )
+            try:
+                send_telegram("âš ï¸ Bot got stuck and is force-restarting itself now (watchdog triggered). Back online shortly.")
+            except Exception:
+                pass
+            os._exit(1)
+
+
+def _start_watchdog():
+    global _last_heartbeat
+    _last_heartbeat = time.time()
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 
 async def run_bot_cycle():
@@ -766,6 +835,7 @@ async def run_bot_cycle():
 
 
 def main():
+    _start_watchdog()
     while True:
         try:
             asyncio.run(run_bot_cycle())
@@ -775,4 +845,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()                                             
+    main()
