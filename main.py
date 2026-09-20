@@ -85,7 +85,7 @@ SYMBOL_REFRESH_SECONDS = 3600    # re-seed + reconnect hourly to pick up new/del
 STREAMS_PER_SUBSCRIBE = 200      # batch size for SUBSCRIBE messages
 
 VOL_MA_PERIODS = [10, 20, 30, 50]
-VOL_MULTIPLIER = 1.0             # RVOL threshold vs. ANY ONE of the MA periods above
+VOL_MULTIPLIER = 2.0             # RVOL threshold vs. ANY ONE of the MA periods above
 
 RALLY_MIN_BODY_PCT = 0.4         # min body % for a green rally candle
 PULLBACK_MAX_VOL_RATIO = 0.6     # pullback candle volume must be <= 60% of avg rally candle volume
@@ -97,8 +97,110 @@ log = logging.getLogger("wavebot")
 
 # symbol -> list of open positions: [{"qty":.., "entry_price":.., "entry_fee":.., "entry_time":.., "stage":..}]
 _open_positions = {}
-_realized_pnl_total = 0.0
 _entries_taken = {}  # f"{symbol}-{stage}-{candle_open_time}" -> timestamp added (dedup guard)
+
+# ----------------------------- PERSISTED STATS -----------------------------
+# Everything above is in-memory only, which is wiped on every restart --
+# including the watchdog's own restarts, and every time new code is
+# deployed. This writes the running totals to a small JSON file so they
+# survive restarts. Set PNL_STATE_PATH to a Railway Volume's mount path
+# (e.g. /data/pnl_state.json) for it to also survive full redeploys --
+# without a Volume, it only survives same-deployment restarts (like the
+# watchdog firing), not a brand new deploy.
+# ----------------------------- PERSISTED STATS -----------------------------
+# Everything above is in-memory only, which is wiped on every restart --
+# including the watchdog's own restarts, and every time new code is
+# deployed (Railway's disk is NOT persisted across redeploys without a paid
+# Volume). Rather than requiring a Volume (extra manual Railway setup),
+# stats are persisted in a pinned Telegram message instead -- using
+# infrastructure that's already set up. A local JSON file is also written
+# as a fast, redundant backup for same-deployment restarts, but Telegram is
+# the source of truth that survives full redeploys too.
+PNL_STATE_PATH = os.environ.get("PNL_STATE_PATH", "pnl_state.json")
+_stats = {"realized_pnl_total": 0.0, "trades_closed": 0, "wins": 0, "losses": 0}
+_stats_message_id = None  # the pinned Telegram message we keep editing
+STATS_MARKER = "STATS_JSON:"
+
+
+def _save_stats_local():
+    try:
+        dirpath = os.path.dirname(PNL_STATE_PATH)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        with open(PNL_STATE_PATH, "w") as f:
+            json.dump(_stats, f)
+    except Exception as e:
+        log.warning("Could not save local stats backup: %s", e)
+
+
+def _sync_stats_to_telegram():
+    global _stats_message_id
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    text = (
+        "ðŸ“Œ Bot stats (auto-updated -- please don't delete or unpin this message)\n"
+        f"Lifetime PnL: {_stats['realized_pnl_total']:.2f} USDT\n"
+        f"Trades: {_stats['trades_closed']} (W:{_stats['wins']} L:{_stats['losses']})\n"
+        f"{STATS_MARKER}{json.dumps(_stats)}"
+    )
+    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    try:
+        if _stats_message_id is None:
+            r = requests.post(f"{base}/sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+            result = r.json().get("result", {})
+            _stats_message_id = result.get("message_id")
+            if _stats_message_id:
+                requests.post(f"{base}/pinChatMessage", data={
+                    "chat_id": TELEGRAM_CHAT_ID, "message_id": _stats_message_id, "disable_notification": True
+                }, timeout=10)
+        else:
+            requests.post(f"{base}/editMessageText", data={
+                "chat_id": TELEGRAM_CHAT_ID, "message_id": _stats_message_id, "text": text
+            }, timeout=10)
+    except Exception as e:
+        log.warning("Could not sync stats to Telegram: %s", e)
+
+
+def _load_stats_from_telegram() -> bool:
+    """Recover _stats (and which message to keep editing) from the pinned
+    Telegram message. Returns True if it found and loaded one."""
+    global _stats_message_id
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat",
+                          params={"chat_id": TELEGRAM_CHAT_ID}, timeout=10)
+        pinned = r.json().get("result", {}).get("pinned_message")
+        if not pinned or STATS_MARKER not in pinned.get("text", ""):
+            return False
+        json_str = pinned["text"].split(STATS_MARKER, 1)[1].strip()
+        loaded = json.loads(json_str)
+        _stats.update(loaded)
+        _stats_message_id = pinned.get("message_id")
+        return True
+    except Exception as e:
+        log.warning("Could not load stats from pinned Telegram message: %s", e)
+        return False
+
+
+def _load_stats():
+    if _load_stats_from_telegram():
+        log.info("Stats recovered from pinned Telegram message: %s", _stats)
+        return
+    try:
+        if os.path.exists(PNL_STATE_PATH):
+            with open(PNL_STATE_PATH, "r") as f:
+                _stats.update(json.load(f))
+            log.info("Stats recovered from local backup file: %s", _stats)
+            return
+    except Exception as e:
+        log.warning("Could not load local stats backup either: %s", e)
+    log.info("No prior stats found anywhere -- starting fresh: %s", _stats)
+
+
+def _save_stats():
+    _save_stats_local()
+    _sync_stats_to_telegram()
 
 
 def _entry_already_taken(symbol: str, stage: str, candle_key) -> bool:
@@ -497,7 +599,6 @@ def open_long(symbol: str, stage: str, detail: dict = None):
 
 
 def close_all_for_symbol(symbol: str):
-    global _realized_pnl_total
     positions = _open_positions.get(symbol)
     if not positions:
         return
@@ -517,28 +618,39 @@ def close_all_for_symbol(symbol: str):
         gross_pnl = quote_received - cost_basis
         total_fees = pos.get("entry_fee", 0) + exit_fee
         pnl = gross_pnl - total_fees
-        _realized_pnl_total += pnl
+        _stats["realized_pnl_total"] += pnl
+        _stats["trades_closed"] += 1
+        if pnl >= 0:
+            _stats["wins"] += 1
+        else:
+            _stats["losses"] += 1
+        _save_stats()
         hold_minutes = (time.time() - pos["entry_time"]) / 60
+        win_rate = (_stats["wins"] / _stats["trades_closed"] * 100) if _stats["trades_closed"] else 0
         log.info(
             "TRADE CLOSE %s [%s] | entry=%.6f exit=%.6f gross=%.2f fees=%.2f net_pnl=%.2f USDT "
-            "(%.1f min held) | running total net pnl=%.2f",
+            "(%.1f min held) | LIFETIME: total_pnl=%.2f | trades=%d (win=%d loss=%d, %.1f%% win rate)",
             symbol, pos["stage"], pos["entry_price"], exit_price, gross_pnl, total_fees, pnl,
-            hold_minutes, _realized_pnl_total
+            hold_minutes, _stats["realized_pnl_total"], _stats["trades_closed"], _stats["wins"],
+            _stats["losses"], win_rate
         )
     del _open_positions[symbol]
 
 
 def log_portfolio_summary(also_telegram: bool = False):
+    win_rate = (_stats["wins"] / _stats["trades_closed"] * 100) if _stats["trades_closed"] else 0
+    trailer = (f"LIFETIME: total_pnl={_stats['realized_pnl_total']:.2f} USDT | "
+               f"trades={_stats['trades_closed']} (win={_stats['wins']} loss={_stats['losses']}, "
+               f"{win_rate:.1f}% win rate)")
     if not _open_positions:
-        msg = (f"PORTFOLIO: no open positions | 0/{MAX_CONCURRENT_TRADES} slots used | "
-               f"realized net PnL (fees included): {_realized_pnl_total:.2f} USDT")
+        msg = f"PORTFOLIO: no open positions | 0/{MAX_CONCURRENT_TRADES} slots used\n{trailer}"
     else:
         lines = []
         for s, positions in _open_positions.items():
             for p in positions:
                 lines.append(f"{s} [{p['stage']}]: qty={p['qty']:.4f} entry={p['entry_price']:.6f}")
-        msg = (f"PORTFOLIO: {total_open_trades()}/{MAX_CONCURRENT_TRADES} slots used | "
-               f"realized net PnL (fees included): {_realized_pnl_total:.2f} USDT\n  " + "\n  ".join(lines))
+        msg = (f"PORTFOLIO: {total_open_trades()}/{MAX_CONCURRENT_TRADES} slots used\n  " +
+               "\n  ".join(lines) + f"\n{trailer}")
     log.info(msg.replace(chr(10), "\n"))
     if also_telegram:
         send_telegram(f"ðŸ“Š Status update\n{msg}")
@@ -662,6 +774,29 @@ def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
             _run_bg(close_all_for_symbol, symbol)
 
 
+def _live_rvol_detail(volume, vol_ma_lookup, last_closed_row) -> dict:
+    """Same shape as _entry_detail, but computes RVOL from the ACTUAL live
+    tick's volume against the watch state's vol_ma reference -- not the
+    stale closed candle's own ratio -- so the logged number always matches
+    exactly what the breakout gate itself checked."""
+    best_period, best_ratio = None, 0.0
+    if vol_ma_lookup:
+        for p in VOL_MA_PERIODS:
+            ma = vol_ma_lookup.get(p)
+            if ma and ma > 0:
+                ratio = volume / ma
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_period = p
+    return {
+        "rvol_ratio": best_ratio,
+        "rvol_period": best_period,
+        "macd": last_closed_row["macd"],
+        "macd_signal": last_closed_row["macd_signal"],
+        "macd_above_signal": last_closed_row["macd"] > last_closed_row["macd_signal"],
+    }
+
+
 def on_live_tick(symbol: str, high: float, close: float, volume: float, open_time):
     state = _symbol_state.get(symbol)
     if state is None:
@@ -674,11 +809,10 @@ def on_live_tick(symbol: str, high: float, close: float, volume: float, open_tim
         stage = watch["stage"]
         if _entry_already_taken(symbol, stage, candle_key):
             return
-        # Build a lightweight detail dict from the last known closed-candle
-        # indicators (good enough for logging -- indicators don't move much
-        # within one 5m candle).
+        # Reflects the EXACT live volume/RVOL that was just gated above --
+        # not a stale closed-candle number.
         last_closed = state["df"].iloc[-1]
-        detail = _entry_detail(last_closed)
+        detail = _live_rvol_detail(volume, watch.get("vol_ma_lookup"), last_closed)
         _mark_entry_taken(symbol, stage, candle_key)
         tag = "ðŸŸ¢ SPOT" if state["tradeable"] else "ðŸŸ¡ ALPHA (manual only)"
         msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout (live)\nPrice: {close:.6f}\nTimeframe: 5m"
@@ -835,6 +969,7 @@ async def run_bot_cycle():
 
 
 def main():
+    _load_stats()
     _start_watchdog()
     while True:
         try:
