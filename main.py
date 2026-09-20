@@ -240,10 +240,7 @@ def _rvol_ok(row) -> bool:
 
 
 def _trend_ok(row) -> bool:
-    # Ross Cameron's trend filter is simply "above EMA20" -- the earlier
-    # 4-way EMA9>EMA20>VWAP>EMA200 stack was far stricter than his actual
-    # criteria and was likely why so few trades were firing.
-    return row["close"] > row["ema20"] and row["ema9"] > row["ema20"]
+    return row["ema9"] > row["ema20"] > row["vwap"] > row["ema200"]
 
 
 def _macd_ok(row) -> bool:
@@ -411,48 +408,6 @@ def check_exit_row(row) -> bool:
     """Exit rule: get out the moment the first red candle appears right
     after the rally you entered on. `row` is the newest CLOSED candle."""
     return row["close"] < row["open"]
-
-
-# ----------------------------- ROSS CAMERON: ADDITIONAL SETUPS -------------
-# Warrior Trading's actual method isn't just one pattern -- Bull Flag (above),
-# VWAP Bounce, and a High-Of-Day-style breakout are three of his core,
-# distinct setups. Having only the Bull Flag state machine (which needs a
-# fairly specific multi-candle sequence) was too restrictive -- these two
-# simpler, independent setups give more legitimate entry opportunities
-# without loosening quality, since each still requires trend + RVOL.
-NEW_HIGH_LOOKBACK_CANDLES = 24    # ~2 hours on 5m candles -- crypto's 24/7 analogue to "High of Day"
-VWAP_BOUNCE_VOL_MULT = 1.3        # bounce candle's volume must beat the prior (VWAP-touch) candle by this much
-VWAP_TOUCH_TOLERANCE = 0.002      # how close to VWAP counts as "touched" (0.2%)
-
-
-def check_new_high_breakout(df: pd.DataFrame):
-    """Ross's 'High of Day' continuation play, adapted for a 24/7 market:
-    price breaks above the highest high of the last N candles, on rising
-    volume, while trend holds."""
-    if len(df) < NEW_HIGH_LOOKBACK_CANDLES + 2:
-        return None
-    row = df.iloc[-1]
-    window = df.iloc[-(NEW_HIGH_LOOKBACK_CANDLES + 1):-1]
-    prior_high = window["high"].max()
-    is_green = row["close"] > row["open"]
-    if is_green and row["high"] > prior_high and _rvol_ok(row) and _trend_ok(row) and _macd_ok(row):
-        return "hod_breakout", row["close"], row["open_time"], _entry_detail(row)
-    return None
-
-
-def check_vwap_bounce(df: pd.DataFrame):
-    """Ross's VWAP Bounce: price pulls back to touch/near VWAP, then bounces
-    -- closes back above VWAP on a green candle with a pickup in volume."""
-    if len(df) < 5:
-        return None
-    prev, row = df.iloc[-2], df.iloc[-1]
-    touched_vwap = prev["low"] <= prev["vwap"] * (1 + VWAP_TOUCH_TOLERANCE)
-    is_green = row["close"] > row["open"]
-    bounced_above = row["close"] > row["vwap"]
-    vol_ok = row["volume"] >= VWAP_BOUNCE_VOL_MULT * prev["volume"]
-    if touched_vwap and is_green and bounced_above and vol_ok and _trend_ok(row) and _macd_ok(row):
-        return "vwap_bounce", row["close"], row["open_time"], _entry_detail(row)
-    return None
 
 
 # ----------------------------- TESTNET TRADING ----------------------------
@@ -672,13 +627,8 @@ def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
 
     entry_result, watch_state = run_state_machine(df)
     state["watch"] = watch_state
-
-    # Check all three Ross Cameron setups independently -- any one firing
-    # is a valid entry. Each is dedup-guarded by its own (symbol, stage,
-    # candle) key, so they never double-fire the same setup twice.
-    for result in (entry_result, check_new_high_breakout(df), check_vwap_bounce(df)):
-        if result:
-            _run_bg(_signal_and_maybe_trade, symbol, state["tradeable"], result)
+    if entry_result:
+        _run_bg(_signal_and_maybe_trade, symbol, state["tradeable"], entry_result)
 
     if state["tradeable"] and symbol in _open_positions:
         last_row = df.iloc[-1]
@@ -825,4 +775,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()                                             
