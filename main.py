@@ -138,7 +138,7 @@ def _sync_stats_to_telegram():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     text = (
-        "ðŸ“Œ Bot stats (auto-updated -- please don't delete or unpin this message)\n"
+        "ð Bot stats (auto-updated -- please don't delete or unpin this message)\n"
         f"Lifetime PnL: {_stats['realized_pnl_total']:.2f} USDT\n"
         f"Trades: {_stats['trades_closed']} (W:{_stats['wins']} L:{_stats['losses']})\n"
         f"{STATS_MARKER}{json.dumps(_stats)}"
@@ -396,7 +396,28 @@ def _entry_detail(row) -> dict:
         "macd": row["macd"],
         "macd_signal": row["macd_signal"],
         "macd_above_signal": row["macd"] > row["macd_signal"],
+        "ema9": row["ema9"],
+        "ema20": row["ema20"],
+        "vwap": row["vwap"],
+        "ema200": row["ema200"],
     }
+
+
+def _detail_line(detail: dict) -> str:
+    """One consistent, full-detail line used everywhere a signal/trade is
+    logged -- RVOL, MACD, the EMA9>EMA20>VWAP>EMA200 trend stack, and the
+    pullback's actual retracement % (vs. the 30% ceiling -- lower is
+    better), each value shown explicitly."""
+    retrace = detail.get("pullback_retrace_pct")
+    retrace_str = f" | Pullback retrace: {retrace:.1f}% of rally (max allowed {INVALIDATION_RETRACE_PCT*100:.0f}%)" if retrace is not None else ""
+    return (
+        f"RVOL={detail['rvol_ratio']:.2f}x (vs {detail['rvol_period']}-period MA) | "
+        f"MACD {'above' if detail['macd_above_signal'] else 'below'} signal "
+        f"(macd={detail['macd']:.6f}, signal={detail['macd_signal']:.6f}) | "
+        f"Trend: EMA9={detail['ema9']:.6f} > EMA20={detail['ema20']:.6f} > "
+        f"VWAP={detail['vwap']:.6f} > EMA200={detail['ema200']:.6f}"
+        f"{retrace_str}"
+    )
 
 
 # ----------------------------- WAVE STATE MACHINE --------------------------
@@ -425,6 +446,7 @@ def run_state_machine(df: pd.DataFrame):
     rally_range = None
     pullback_candles = []
     pullback_first_high = None
+    pullback_max_retrace_pct = 0.0
     watch_candles = []
     stage_after_pullback = None
     entry_index = None
@@ -448,6 +470,7 @@ def run_state_machine(df: pd.DataFrame):
                     rally_range = (min(c["low"] for c in rally_candles), max(c["high"] for c in rally_candles))
                     phase = "PULLBACK"
                     pullback_candles = []
+                    pullback_max_retrace_pct = 0.0
                     stage_after_pullback = "rally2"
             else:
                 rally_candles = []
@@ -458,8 +481,10 @@ def run_state_machine(df: pd.DataFrame):
                 r_high, r_low = rally_range[1], rally_range[0]
                 r_size = r_high - r_low
                 retrace = r_high - row["low"]
+                retrace_pct = (retrace / r_size) if r_size > 0 else 0
+                pullback_max_retrace_pct = max(pullback_max_retrace_pct, retrace_pct)
                 rally_avg_vol = _avg_vol(rally_candles)
-                too_deep = r_size > 0 and (retrace / r_size) >= INVALIDATION_RETRACE_PCT
+                too_deep = retrace_pct >= INVALIDATION_RETRACE_PCT
                 too_heavy = rally_avg_vol > 0 and row["volume"] > PULLBACK_MAX_VOL_RATIO * rally_avg_vol
                 if too_deep or too_heavy:
                     phase = "WAIT_RALLY1"
@@ -475,11 +500,13 @@ def run_state_machine(df: pd.DataFrame):
                         entry_stage = stage_after_pullback
                         entry_price = row["close"]
                         entry_detail = _entry_detail(row)
+                        entry_detail["pullback_retrace_pct"] = pullback_max_retrace_pct * 100
                         if stage_after_pullback == "rally2":
                             rally_range = (min(c["low"] for c in watch_candles), max(c["high"] for c in watch_candles))
                             rally_candles = list(watch_candles)
                             phase = "PULLBACK"
                             pullback_candles = []
+                            pullback_max_retrace_pct = 0.0
                             stage_after_pullback = "rally3"
                         else:
                             phase = "WAIT_RALLY1"
@@ -496,11 +523,13 @@ def run_state_machine(df: pd.DataFrame):
                     entry_stage = stage_after_pullback
                     entry_price = row["close"]
                     entry_detail = _entry_detail(row)
+                    entry_detail["pullback_retrace_pct"] = pullback_max_retrace_pct * 100
                     if stage_after_pullback == "rally2":
                         rally_range = (min(c["low"] for c in watch_candles), max(c["high"] for c in watch_candles))
                         rally_candles = list(watch_candles)
                         phase = "PULLBACK"
                         pullback_candles = []
+                        pullback_max_retrace_pct = 0.0
                         stage_after_pullback = "rally3"
                     else:
                         phase = "WAIT_RALLY1"
@@ -526,6 +555,7 @@ def run_state_machine(df: pd.DataFrame):
             "prev_volume": prev_vol,
             "stage": stage_after_pullback,
             "vol_ma_lookup": _row_vol_ma_lookup(last_row),
+            "pullback_retrace_pct": pullback_max_retrace_pct * 100,
         }
 
     return entry_result, watch_state
@@ -587,13 +617,7 @@ def open_long(symbol: str, stage: str, detail: dict = None):
         "qty": qty, "entry_price": entry_price, "entry_fee": entry_fee,
         "entry_time": time.time(), "stage": stage
     })
-    detail_str = ""
-    if detail:
-        detail_str = (
-            f" | RVOL={detail['rvol_ratio']:.2f}x (vs {detail['rvol_period']}-period MA) | "
-            f"MACD {'above' if detail['macd_above_signal'] else 'below'} signal "
-            f"(macd={detail['macd']:.6f}, signal={detail['macd_signal']:.6f})"
-        )
+    detail_str = f" | {_detail_line(detail)}" if detail else ""
     log.info("TRADE OPEN  %s [%s] | qty=%.6f entry=%.6f cost=%.2f USDT (fee ~%.3f) | open trades=%d/%d%s",
               symbol, stage, qty, entry_price, quote_spent, entry_fee, total_open_trades(), MAX_CONCURRENT_TRADES, detail_str)
 
@@ -627,13 +651,15 @@ def close_all_for_symbol(symbol: str):
         _save_stats()
         hold_minutes = (time.time() - pos["entry_time"]) / 60
         win_rate = (_stats["wins"] / _stats["trades_closed"] * 100) if _stats["trades_closed"] else 0
-        log.info(
-            "TRADE CLOSE %s [%s] | entry=%.6f exit=%.6f gross=%.2f fees=%.2f net_pnl=%.2f USDT "
-            "(%.1f min held) | LIFETIME: total_pnl=%.2f | trades=%d (win=%d loss=%d, %.1f%% win rate)",
-            symbol, pos["stage"], pos["entry_price"], exit_price, gross_pnl, total_fees, pnl,
-            hold_minutes, _stats["realized_pnl_total"], _stats["trades_closed"], _stats["wins"],
-            _stats["losses"], win_rate
+        close_msg = (
+            f"{'ð¢' if pnl >= 0 else 'ð´'} TRADE CLOSE {symbol} [{pos['stage']}]\n"
+            f"Entry: {pos['entry_price']:.6f} | Exit: {exit_price:.6f}\n"
+            f"This trade: gross={gross_pnl:.2f} fees={total_fees:.2f} net={pnl:.2f} USDT ({hold_minutes:.1f} min held)\n"
+            f"Lifetime: total PnL={_stats['realized_pnl_total']:.2f} USDT | "
+            f"{_stats['trades_closed']} trades (W:{_stats['wins']} L:{_stats['losses']}, {win_rate:.1f}% win rate)"
         )
+        log.info(close_msg.replace(chr(10), " | "))
+        send_telegram(close_msg)
     del _open_positions[symbol]
 
 
@@ -653,7 +679,7 @@ def log_portfolio_summary(also_telegram: bool = False):
                "\n  ".join(lines) + f"\n{trailer}")
     log.info(msg.replace(chr(10), "\n"))
     if also_telegram:
-        send_telegram(f"ðŸ“Š Status update\n{msg}")
+        send_telegram(f"ð Status update\n{msg}")
 
 
 # ----------------------------- PER-SYMBOL STATE ----------------------------
@@ -700,13 +726,10 @@ def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
     if _entry_already_taken(symbol, stage, candle_key):
         return
     _mark_entry_taken(symbol, stage, candle_key)
-    tag = "ðŸŸ¢ SPOT" if tradeable else "ðŸŸ¡ ALPHA (manual only)"
-    msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m"
-    log.info(
-        "SIGNAL: %s | RVOL=%.2fx (vs %s-period MA) | MACD %s signal (macd=%.6f, signal=%.6f)",
-        msg.replace(chr(10), " | "), detail["rvol_ratio"], detail["rvol_period"],
-        "above" if detail["macd_above_signal"] else "below", detail["macd"], detail["macd_signal"]
-    )
+    tag = "ð¢ SPOT" if tradeable else "ð¡ ALPHA (manual only)"
+    msg = (f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m\n"
+           f"{_detail_line(detail)}")
+    log.info(msg.replace(chr(10), " | "))
     send_telegram(msg)
     if tradeable and ENABLE_TRADING:
         open_long(symbol, stage, detail)
@@ -794,6 +817,10 @@ def _live_rvol_detail(volume, vol_ma_lookup, last_closed_row) -> dict:
         "macd": last_closed_row["macd"],
         "macd_signal": last_closed_row["macd_signal"],
         "macd_above_signal": last_closed_row["macd"] > last_closed_row["macd_signal"],
+        "ema9": last_closed_row["ema9"],
+        "ema20": last_closed_row["ema20"],
+        "vwap": last_closed_row["vwap"],
+        "ema200": last_closed_row["ema200"],
     }
 
 
@@ -813,14 +840,12 @@ def on_live_tick(symbol: str, high: float, close: float, volume: float, open_tim
         # not a stale closed-candle number.
         last_closed = state["df"].iloc[-1]
         detail = _live_rvol_detail(volume, watch.get("vol_ma_lookup"), last_closed)
+        detail["pullback_retrace_pct"] = watch.get("pullback_retrace_pct", 0.0)
         _mark_entry_taken(symbol, stage, candle_key)
-        tag = "ðŸŸ¢ SPOT" if state["tradeable"] else "ðŸŸ¡ ALPHA (manual only)"
-        msg = f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout (live)\nPrice: {close:.6f}\nTimeframe: 5m"
-        log.info(
-            "SIGNAL (live): %s | RVOL=%.2fx (vs %s-period MA) | MACD %s signal (macd=%.6f, signal=%.6f)",
-            msg.replace(chr(10), " | "), detail["rvol_ratio"], detail["rvol_period"],
-            "above" if detail["macd_above_signal"] else "below", detail["macd"], detail["macd_signal"]
-        )
+        tag = "ð¢ SPOT" if state["tradeable"] else "ð¡ ALPHA (manual only)"
+        msg = (f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout (live)\nPrice: {close:.6f}\nTimeframe: 5m\n"
+               f"{_detail_line(detail)}")
+        log.info(msg.replace(chr(10), " | "))
         _run_bg(send_telegram, msg)
         if state["tradeable"] and ENABLE_TRADING:
             _run_bg(open_long, symbol, stage, detail)
@@ -891,26 +916,31 @@ async def alpha_ws_loop(alpha_tokens):
 
 
 async def periodic_tasks(duration_seconds):
-    """Logs a heartbeat/portfolio summary every minute; returns (letting the
-    caller trigger a full reseed+reconnect) after `duration_seconds`."""
+    """Updates the heartbeat every minute (silently, for the watchdog) but
+    only PRINTS a status line every HEALTH_LOG_EVERY_SECONDS, so routine
+    logs don't drown out the entry/exit lines that actually matter. Nothing
+    here ever goes to Telegram -- Telegram only gets the actual trade
+    signal/open/close messages, never periodic status noise. Returns
+    (letting the caller trigger a full reseed+reconnect) after
+    `duration_seconds`."""
     global _last_heartbeat
     elapsed = 0
-    TELEGRAM_SUMMARY_EVERY_SECONDS = 6 * 3600  # also post the summary to Telegram every 6h
-    since_telegram_summary = 0
+    HEALTH_LOG_EVERY_SECONDS = 30 * 60          # print a routine status line only this often
+    since_health_log = 0
     while elapsed < duration_seconds:
         await asyncio.sleep(60)
         elapsed += 60
-        since_telegram_summary += 60
-        _last_heartbeat = time.time()
+        since_health_log += 60
+        _last_heartbeat = time.time()  # keeps the watchdog satisfied every cycle, no log line needed for this alone
         _prune_old_entries()
-        send_to_telegram_too = since_telegram_summary >= TELEGRAM_SUMMARY_EVERY_SECONDS
-        if send_to_telegram_too:
-            since_telegram_summary = 0
-        log_portfolio_summary(also_telegram=send_to_telegram_too)
-        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        pending = _CANDLE_EXECUTOR._work_queue.qsize()
-        log.info("HEALTH: memory=%.1fMB | symbols_tracked=%d | candle-close queue backlog=%d | dedup_cache=%d",
-                  mem_mb, len(_symbol_state), pending, len(_entries_taken))
+
+        if since_health_log >= HEALTH_LOG_EVERY_SECONDS:
+            since_health_log = 0
+            log_portfolio_summary(also_telegram=False)
+            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            pending = _CANDLE_EXECUTOR._work_queue.qsize()
+            log.info("HEALTH: memory=%.1fMB | symbols_tracked=%d | candle-close queue backlog=%d | dedup_cache=%d",
+                      mem_mb, len(_symbol_state), pending, len(_entries_taken))
 
 
 # ----------------------------- WATCHDOG ------------------------------------
@@ -936,7 +966,7 @@ def _watchdog_loop():
                 WATCHDOG_TIMEOUT_SECONDS
             )
             try:
-                send_telegram("âš ï¸ Bot got stuck and is force-restarting itself now (watchdog triggered). Back online shortly.")
+                send_telegram("â ï¸ Bot got stuck and is force-restarting itself now (watchdog triggered). Back online shortly.")
             except Exception:
                 pass
             os._exit(1)
@@ -959,7 +989,7 @@ async def run_bot_cycle():
         bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID), ENABLE_TRADING,
         ACCOUNT_BUDGET_USDT, TRADE_SIZE_USDT, MAX_CONCURRENT_TRADES
     )
-    send_telegram("âœ… Wave strategy bot is online (real-time WebSocket, Spot + Alpha).")
+    send_telegram("â Wave strategy bot is online (real-time WebSocket, Spot + Alpha).")
 
     await asyncio.gather(
         spot_ws_loop(spot_symbols),
