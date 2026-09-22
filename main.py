@@ -98,6 +98,9 @@ log = logging.getLogger("wavebot")
 # symbol -> list of open positions: [{"qty":.., "entry_price":.., "entry_fee":.., "entry_time":.., "stage":..}]
 _open_positions = {}
 _entries_taken = {}  # f"{symbol}-{stage}-{candle_open_time}" -> timestamp added (dedup guard)
+_trade_history = []  # capped list of closed-trade records, for the performance breakdown
+TRADE_HISTORY_MAX = 200
+BREAKDOWN_EVERY_N_TRADES = 40  # send a performance breakdown after every N closed trades
 
 # ----------------------------- PERSISTED STATE -----------------------------
 # Everything above is in-memory only, which is wiped on every restart --
@@ -106,18 +109,31 @@ _entries_taken = {}  # f"{symbol}-{stage}-{candle_open_time}" -> timestamp added
 # Volume). That includes _open_positions itself: if a position was open
 # when a redeploy happened, the bot would completely forget it existed --
 # no exit, no PnL, nothing, even though the position was still live on the
-# exchange. So BOTH _stats and _open_positions are persisted together, in a
-# pinned Telegram message (using infrastructure that's already set up,
-# no Railway Volume needed) plus a local JSON file as a redundant backup
-# for same-deployment restarts.
+# exchange. So _stats and _open_positions are persisted together, in a
+# pinned Telegram message (using infrastructure that's already set up, no
+# Railway Volume needed) -- kept deliberately small so it fits Telegram's
+# message size limit. _trade_history is bulkier (needed for the
+# performance breakdown) and only financially-inert analytics, so it's only
+# persisted to the local JSON file backup -- fine for same-deployment
+# restarts, may reset on a full redeploy, which doesn't matter financially.
 PNL_STATE_PATH = os.environ.get("PNL_STATE_PATH", "pnl_state.json")
 _stats = {"realized_pnl_total": 0.0, "trades_closed": 0, "wins": 0, "losses": 0}
 _stats_message_id = None  # the pinned Telegram message we keep editing
 STATS_MARKER = "STATS_JSON:"
 
 
-def _persisted_payload() -> dict:
+def _persisted_payload_compact() -> dict:
+    """Small payload synced to the pinned Telegram message -- stats + open
+    positions only, kept under Telegram's message size limit."""
     return {"stats": _stats, "open_positions": _open_positions}
+
+
+def _persisted_payload_full() -> dict:
+    """Everything, including trade history -- written to the local file
+    backup only (never sent to Telegram, could get large)."""
+    payload = _persisted_payload_compact()
+    payload["trade_history"] = _trade_history
+    return payload
 
 
 def _apply_persisted_payload(data: dict):
@@ -126,6 +142,9 @@ def _apply_persisted_payload(data: dict):
     if "open_positions" in data and isinstance(data["open_positions"], dict):
         _open_positions.clear()
         _open_positions.update(data["open_positions"])
+    if "trade_history" in data and isinstance(data["trade_history"], list):
+        _trade_history.clear()
+        _trade_history.extend(data["trade_history"])
 
 
 def _save_state_local():
@@ -134,7 +153,7 @@ def _save_state_local():
         if dirpath:
             os.makedirs(dirpath, exist_ok=True)
         with open(PNL_STATE_PATH, "w") as f:
-            json.dump(_persisted_payload(), f)
+            json.dump(_persisted_payload_full(), f)
     except Exception as e:
         log.warning("Could not save local state backup: %s", e)
 
@@ -149,7 +168,7 @@ def _sync_state_to_telegram():
         f"Lifetime PnL: {_stats['realized_pnl_total']:.2f} USDT\n"
         f"Trades: {_stats['trades_closed']} (W:{_stats['wins']} L:{_stats['losses']})\n"
         f"Open positions right now: {open_count}\n"
-        f"{STATS_MARKER}{json.dumps(_persisted_payload())}"
+        f"{STATS_MARKER}{json.dumps(_persisted_payload_compact())}"
     )
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     try:
@@ -623,12 +642,84 @@ def open_long(symbol: str, stage: str, detail: dict = None):
     entry_fee = quote_spent * FEE_RATE
     _open_positions.setdefault(symbol, []).append({
         "qty": qty, "entry_price": entry_price, "entry_fee": entry_fee,
-        "entry_time": time.time(), "stage": stage
+        "entry_time": time.time(), "stage": stage,
+        "entry_rvol_ratio": detail.get("rvol_ratio") if detail else None,
+        "entry_rvol_period": detail.get("rvol_period") if detail else None,
+        "entry_retrace_pct": detail.get("pullback_retrace_pct") if detail else None,
     })
     _save_stats()  # persist the newly-opened position immediately -- don't wait for it to close
     detail_str = f" | {_detail_line(detail)}" if detail else ""
     log.info("TRADE OPEN  %s [%s] | qty=%.6f entry=%.6f cost=%.2f USDT (fee ~%.3f) | open trades=%d/%d%s",
               symbol, stage, qty, entry_price, quote_spent, entry_fee, total_open_trades(), MAX_CONCURRENT_TRADES, detail_str)
+
+
+def _bucket_rvol(ratio):
+    if ratio is None:
+        return None
+    if ratio < 3:
+        return "2-3x"
+    if ratio < 5:
+        return "3-5x"
+    return "5x+"
+
+
+def _bucket_retrace(pct):
+    if pct is None:
+        return None
+    if pct < 10:
+        return "0-10%"
+    if pct < 20:
+        return "10-20%"
+    return "20-30%"
+
+
+def _summarize_bucket(records, bucket_fn, label) -> str:
+    buckets = {}
+    for r in records:
+        key = bucket_fn(r)
+        if key is None:
+            continue
+        b = buckets.setdefault(key, {"count": 0, "wins": 0, "pnl": 0.0})
+        b["count"] += 1
+        if r["win"]:
+            b["wins"] += 1
+        b["pnl"] += r["pnl"]
+    lines = [f"By {label}:"]
+    if not buckets:
+        lines.append("  (no data)")
+    for key in sorted(buckets.keys()):
+        b = buckets[key]
+        win_rate = b["wins"] / b["count"] * 100 if b["count"] else 0
+        avg_pnl = b["pnl"] / b["count"] if b["count"] else 0
+        lines.append(f"  {key}: {b['count']} trades, {win_rate:.1f}% win, avg pnl {avg_pnl:+.2f} USDT")
+    return "\n".join(lines)
+
+
+def _compute_breakdown() -> str:
+    """Breaks the trade history down by RVOL magnitude, which MA period the
+    RVOL matched against, and pullback retracement % -- to see which
+    conditions are actually producing the wins, so thresholds can later be
+    tightened toward whatever's working best."""
+    records = _trade_history
+    if not records:
+        return "ð PERFORMANCE BREAKDOWN: no trade history yet."
+
+    rvol_section = _summarize_bucket(records, lambda r: _bucket_rvol(r.get("rvol_ratio")), "RVOL magnitude")
+    period_section = _summarize_bucket(
+        records, lambda r: f"{r['rvol_period']}-period" if r.get("rvol_period") else None, "RVOL period matched"
+    )
+    retrace_section = _summarize_bucket(records, lambda r: _bucket_retrace(r.get("retrace_pct")), "pullback retracement")
+
+    total = len(records)
+    wins = sum(1 for r in records if r["win"])
+    win_rate = wins / total * 100 if total else 0
+    total_pnl = sum(r["pnl"] for r in records)
+
+    return (
+        f"ð PERFORMANCE BREAKDOWN (last {total} trades)\n\n"
+        f"{rvol_section}\n\n{period_section}\n\n{retrace_section}\n\n"
+        f"Overall: {total} trades, {win_rate:.1f}% win rate, total pnl {total_pnl:+.2f} USDT"
+    )
 
 
 def close_all_for_symbol(symbol: str):
@@ -653,10 +744,21 @@ def close_all_for_symbol(symbol: str):
         pnl = gross_pnl - total_fees
         _stats["realized_pnl_total"] += pnl
         _stats["trades_closed"] += 1
-        if pnl >= 0:
+        win = pnl >= 0
+        if win:
             _stats["wins"] += 1
         else:
             _stats["losses"] += 1
+
+        _trade_history.append({
+            "symbol": symbol, "stage": pos["stage"], "pnl": pnl, "win": win,
+            "rvol_ratio": pos.get("entry_rvol_ratio"),
+            "rvol_period": pos.get("entry_rvol_period"),
+            "retrace_pct": pos.get("entry_retrace_pct"),
+        })
+        if len(_trade_history) > TRADE_HISTORY_MAX:
+            del _trade_history[:len(_trade_history) - TRADE_HISTORY_MAX]
+
         _save_stats()
         hold_minutes = (time.time() - pos["entry_time"]) / 60
         win_rate = (_stats["wins"] / _stats["trades_closed"] * 100) if _stats["trades_closed"] else 0
@@ -669,6 +771,11 @@ def close_all_for_symbol(symbol: str):
         )
         log.info(close_msg.replace(chr(10), " | "))
         send_telegram(close_msg)
+
+        if _stats["trades_closed"] % BREAKDOWN_EVERY_N_TRADES == 0:
+            breakdown_msg = _compute_breakdown()
+            log.info(breakdown_msg.replace(chr(10), " | "))
+            send_telegram(breakdown_msg)
     del _open_positions[symbol]
 
 
