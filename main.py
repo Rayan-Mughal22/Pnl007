@@ -99,49 +99,57 @@ log = logging.getLogger("wavebot")
 _open_positions = {}
 _entries_taken = {}  # f"{symbol}-{stage}-{candle_open_time}" -> timestamp added (dedup guard)
 
-# ----------------------------- PERSISTED STATS -----------------------------
-# Everything above is in-memory only, which is wiped on every restart --
-# including the watchdog's own restarts, and every time new code is
-# deployed. This writes the running totals to a small JSON file so they
-# survive restarts. Set PNL_STATE_PATH to a Railway Volume's mount path
-# (e.g. /data/pnl_state.json) for it to also survive full redeploys --
-# without a Volume, it only survives same-deployment restarts (like the
-# watchdog firing), not a brand new deploy.
-# ----------------------------- PERSISTED STATS -----------------------------
+# ----------------------------- PERSISTED STATE -----------------------------
 # Everything above is in-memory only, which is wiped on every restart --
 # including the watchdog's own restarts, and every time new code is
 # deployed (Railway's disk is NOT persisted across redeploys without a paid
-# Volume). Rather than requiring a Volume (extra manual Railway setup),
-# stats are persisted in a pinned Telegram message instead -- using
-# infrastructure that's already set up. A local JSON file is also written
-# as a fast, redundant backup for same-deployment restarts, but Telegram is
-# the source of truth that survives full redeploys too.
+# Volume). That includes _open_positions itself: if a position was open
+# when a redeploy happened, the bot would completely forget it existed --
+# no exit, no PnL, nothing, even though the position was still live on the
+# exchange. So BOTH _stats and _open_positions are persisted together, in a
+# pinned Telegram message (using infrastructure that's already set up,
+# no Railway Volume needed) plus a local JSON file as a redundant backup
+# for same-deployment restarts.
 PNL_STATE_PATH = os.environ.get("PNL_STATE_PATH", "pnl_state.json")
 _stats = {"realized_pnl_total": 0.0, "trades_closed": 0, "wins": 0, "losses": 0}
 _stats_message_id = None  # the pinned Telegram message we keep editing
 STATS_MARKER = "STATS_JSON:"
 
 
-def _save_stats_local():
+def _persisted_payload() -> dict:
+    return {"stats": _stats, "open_positions": _open_positions}
+
+
+def _apply_persisted_payload(data: dict):
+    if "stats" in data:
+        _stats.update(data["stats"])
+    if "open_positions" in data and isinstance(data["open_positions"], dict):
+        _open_positions.clear()
+        _open_positions.update(data["open_positions"])
+
+
+def _save_state_local():
     try:
         dirpath = os.path.dirname(PNL_STATE_PATH)
         if dirpath:
             os.makedirs(dirpath, exist_ok=True)
         with open(PNL_STATE_PATH, "w") as f:
-            json.dump(_stats, f)
+            json.dump(_persisted_payload(), f)
     except Exception as e:
-        log.warning("Could not save local stats backup: %s", e)
+        log.warning("Could not save local state backup: %s", e)
 
 
-def _sync_stats_to_telegram():
+def _sync_state_to_telegram():
     global _stats_message_id
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    open_count = sum(len(v) for v in _open_positions.values())
     text = (
-        "ð Bot stats (auto-updated -- please don't delete or unpin this message)\n"
+        "ð Bot state (auto-updated -- please don't delete or unpin this message)\n"
         f"Lifetime PnL: {_stats['realized_pnl_total']:.2f} USDT\n"
         f"Trades: {_stats['trades_closed']} (W:{_stats['wins']} L:{_stats['losses']})\n"
-        f"{STATS_MARKER}{json.dumps(_stats)}"
+        f"Open positions right now: {open_count}\n"
+        f"{STATS_MARKER}{json.dumps(_persisted_payload())}"
     )
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     try:
@@ -158,12 +166,12 @@ def _sync_stats_to_telegram():
                 "chat_id": TELEGRAM_CHAT_ID, "message_id": _stats_message_id, "text": text
             }, timeout=10)
     except Exception as e:
-        log.warning("Could not sync stats to Telegram: %s", e)
+        log.warning("Could not sync state to Telegram: %s", e)
 
 
-def _load_stats_from_telegram() -> bool:
-    """Recover _stats (and which message to keep editing) from the pinned
-    Telegram message. Returns True if it found and loaded one."""
+def _load_state_from_telegram() -> bool:
+    """Recover _stats + _open_positions (and which message to keep editing)
+    from the pinned Telegram message. Returns True if it found and loaded one."""
     global _stats_message_id
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
@@ -175,32 +183,32 @@ def _load_stats_from_telegram() -> bool:
             return False
         json_str = pinned["text"].split(STATS_MARKER, 1)[1].strip()
         loaded = json.loads(json_str)
-        _stats.update(loaded)
+        _apply_persisted_payload(loaded)
         _stats_message_id = pinned.get("message_id")
         return True
     except Exception as e:
-        log.warning("Could not load stats from pinned Telegram message: %s", e)
+        log.warning("Could not load state from pinned Telegram message: %s", e)
         return False
 
 
 def _load_stats():
-    if _load_stats_from_telegram():
-        log.info("Stats recovered from pinned Telegram message: %s", _stats)
+    if _load_state_from_telegram():
+        log.info("State recovered from pinned Telegram message: stats=%s | open_positions=%s", _stats, _open_positions)
         return
     try:
         if os.path.exists(PNL_STATE_PATH):
             with open(PNL_STATE_PATH, "r") as f:
-                _stats.update(json.load(f))
-            log.info("Stats recovered from local backup file: %s", _stats)
+                _apply_persisted_payload(json.load(f))
+            log.info("State recovered from local backup file: stats=%s | open_positions=%s", _stats, _open_positions)
             return
     except Exception as e:
-        log.warning("Could not load local stats backup either: %s", e)
-    log.info("No prior stats found anywhere -- starting fresh: %s", _stats)
+        log.warning("Could not load local state backup either: %s", e)
+    log.info("No prior state found anywhere -- starting fresh: %s", _stats)
 
 
 def _save_stats():
-    _save_stats_local()
-    _sync_stats_to_telegram()
+    _save_state_local()
+    _sync_state_to_telegram()
 
 
 def _entry_already_taken(symbol: str, stage: str, candle_key) -> bool:
@@ -617,6 +625,7 @@ def open_long(symbol: str, stage: str, detail: dict = None):
         "qty": qty, "entry_price": entry_price, "entry_fee": entry_fee,
         "entry_time": time.time(), "stage": stage
     })
+    _save_stats()  # persist the newly-opened position immediately -- don't wait for it to close
     detail_str = f" | {_detail_line(detail)}" if detail else ""
     log.info("TRADE OPEN  %s [%s] | qty=%.6f entry=%.6f cost=%.2f USDT (fee ~%.3f) | open trades=%d/%d%s",
               symbol, stage, qty, entry_price, quote_spent, entry_fee, total_open_trades(), MAX_CONCURRENT_TRADES, detail_str)
