@@ -33,7 +33,7 @@ Exit: the moment the first red candle appears right after the rally you
       entered on -- take whatever profit built up.
 
 MONEY MANAGEMENT
-$500 demo budget, $50/trade, max 10 concurrent trades across all coins.
+$500 demo budget, $100/trade, max 5 concurrent trades across all coins.
 Fees: Binance's standard 0.1%-per-side fee is subtracted from PnL even
 though the testnet itself charges 0%, so numbers reflect real-world cost.
 
@@ -68,8 +68,8 @@ TESTNET_API_SECRET = os.environ.get("TESTNET_API_SECRET", "")
 TESTNET_BASE = "https://testnet.binance.vision"
 
 ACCOUNT_BUDGET_USDT = 500
-TRADE_SIZE_USDT = 50
-MAX_CONCURRENT_TRADES = int(ACCOUNT_BUDGET_USDT / TRADE_SIZE_USDT)  # 10
+TRADE_SIZE_USDT = 100
+MAX_CONCURRENT_TRADES = int(ACCOUNT_BUDGET_USDT / TRADE_SIZE_USDT)  # 5
 FEE_RATE = 0.001  # Binance standard spot trading fee: 0.1% per side (entry + exit)
 
 BINANCE_BASE = "https://api.binance.com"
