@@ -103,6 +103,8 @@ TRADE_HISTORY_MAX = 200
 BREAKDOWN_EVERY_N_TRADES = 50  # send a performance breakdown after every N closed trades
 
 # ----------------------------- PERSISTED STATE -----------------------------
+# V2 uses a new state filename + Telegram marker so the previous deployment
+# history is intentionally ignored. From this deployment onward, stats persist.
 # Everything above is in-memory only, which is wiped on every restart --
 # including the watchdog's own restarts, and every time new code is
 # deployed (Railway's disk is NOT persisted across redeploys without a paid
@@ -116,10 +118,10 @@ BREAKDOWN_EVERY_N_TRADES = 50  # send a performance breakdown after every N clos
 # performance breakdown) and only financially-inert analytics, so it's only
 # persisted to the local JSON file backup -- fine for same-deployment
 # restarts, may reset on a full redeploy, which doesn't matter financially.
-PNL_STATE_PATH = os.environ.get("PNL_STATE_PATH", "pnl_state.json")
+PNL_STATE_PATH = os.environ.get("PNL_STATE_PATH", "pnl_state_fresh_v2.json")
 _stats = {"realized_pnl_total": 0.0, "trades_closed": 0, "wins": 0, "losses": 0}
 _stats_message_id = None  # the pinned Telegram message we keep editing
-STATS_MARKER = "STATS_JSON:"
+STATS_MARKER = "STATS_JSON_FRESH_V2:"
 
 
 def _persisted_payload_compact() -> dict:
@@ -222,7 +224,7 @@ def _load_stats():
             return
     except Exception as e:
         log.warning("Could not load local state backup either: %s", e)
-    log.info("No prior state found anywhere -- starting fresh: %s", _stats)
+    log.info("No prior V2 state found -- starting fresh: %s", _stats)
 
 
 def _save_stats():
@@ -1034,6 +1036,9 @@ async def periodic_tasks(duration_seconds):
         elapsed += 60
         _last_heartbeat = time.time()
         _prune_old_entries()
+
+WATCHDOG_TIMEOUT_SECONDS = 300  # restart only if heartbeat is stale for 5 minutes
+
 
 def _watchdog_loop():
     while True:
