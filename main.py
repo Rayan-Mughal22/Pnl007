@@ -164,7 +164,7 @@ def _sync_state_to_telegram():
         return
     open_count = sum(len(v) for v in _open_positions.values())
     text = (
-        "ðŸ“Œ Bot state (auto-updated -- please don't delete or unpin this message)\n"
+        "ð Bot state (auto-updated -- please don't delete or unpin this message)\n"
         f"Lifetime PnL: {_stats['realized_pnl_total']:.2f} USDT\n"
         f"Trades: {_stats['trades_closed']} (W:{_stats['wins']} L:{_stats['losses']})\n"
         f"Open positions right now: {open_count}\n"
@@ -722,7 +722,7 @@ def _compute_breakdown() -> str:
     tightened toward whatever's working best."""
     records = _trade_history
     if not records:
-        return "ðŸ“Š PERFORMANCE BREAKDOWN: no trade history yet."
+        return "ð PERFORMANCE BREAKDOWN: no trade history yet."
 
     rvol_section = _summarize_bucket(records, lambda r: _bucket_rvol(r.get("rvol_ratio")), "RVOL magnitude")
     period_section = _summarize_bucket(
@@ -736,7 +736,7 @@ def _compute_breakdown() -> str:
     total_pnl = sum(r["pnl"] for r in records)
 
     return (
-        f"ðŸ“Š PERFORMANCE BREAKDOWN (last {total} trades)\n\n"
+        f"ð PERFORMANCE BREAKDOWN (last {total} trades)\n\n"
         f"{rvol_section}\n\n{period_section}\n\n{retrace_section}\n\n"
         f"Overall: {total} trades, {win_rate:.1f}% win rate, total pnl {total_pnl:+.2f} USDT"
     )
@@ -783,7 +783,7 @@ def close_all_for_symbol(symbol: str):
         hold_minutes = (time.time() - pos["entry_time"]) / 60
         win_rate = (_stats["wins"] / _stats["trades_closed"] * 100) if _stats["trades_closed"] else 0
         close_msg = (
-            f"{'ðŸŸ¢' if pnl >= 0 else 'ðŸ”´'} TRADE CLOSE {symbol} [{pos['stage']}]\n"
+            f"{'ð¢' if pnl >= 0 else 'ð´'} TRADE CLOSE {symbol} [{pos['stage']}]\n"
             f"Entry: {pos['entry_price']:.6f} | Exit: {exit_price:.6f}\n"
             f"This trade: gross={gross_pnl:.2f} fees={total_fees:.2f} net={pnl:.2f} USDT ({hold_minutes:.1f} min held)\n"
             f"Lifetime: total PnL={_stats['realized_pnl_total']:.2f} USDT | "
@@ -815,7 +815,7 @@ def log_portfolio_summary(also_telegram: bool = False):
                "\n  ".join(lines) + f"\n{trailer}")
     log.info(msg.replace(chr(10), "\n"))
     if also_telegram:
-        send_telegram(f"ðŸ“Š Status update\n{msg}")
+        send_telegram(f"ð Status update\n{msg}")
 
 
 # ----------------------------- PER-SYMBOL STATE ----------------------------
@@ -862,7 +862,7 @@ def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
     if _entry_already_taken(symbol, stage, candle_key):
         return
     _mark_entry_taken(symbol, stage, candle_key)
-    tag = "ðŸŸ¢ SPOT" if tradeable else "ðŸŸ¡ ALPHA (manual only)"
+    tag = "ð¢ SPOT" if tradeable else "ð¡ ALPHA (manual only)"
     msg = (f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m\n"
            f"{_detail_line(detail)}")
     log.info(msg.replace(chr(10), " | "))
@@ -978,7 +978,7 @@ def on_live_tick(symbol: str, high: float, close: float, volume: float, open_tim
         detail = _live_rvol_detail(volume, watch.get("vol_ma_lookup"), last_closed)
         detail["pullback_retrace_pct"] = watch.get("pullback_retrace_pct", 0.0)
         _mark_entry_taken(symbol, stage, candle_key)
-        tag = "ðŸŸ¢ SPOT" if state["tradeable"] else "ðŸŸ¡ ALPHA (manual only)"
+        tag = "ð¢ SPOT" if state["tradeable"] else "ð¡ ALPHA (manual only)"
         msg = (f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout (live)\nPrice: {close:.6f}\nTimeframe: 5m\n"
                f"{_detail_line(detail)}")
         log.info(msg.replace(chr(10), " | "))
@@ -1102,7 +1102,7 @@ def _watchdog_loop():
                 WATCHDOG_TIMEOUT_SECONDS
             )
             try:
-                send_telegram("âš ï¸ Bot got stuck and is force-restarting itself now (watchdog triggered). Back online shortly.")
+                send_telegram("â ï¸ Bot got stuck and is force-restarting itself now (watchdog triggered). Back online shortly.")
             except Exception:
                 pass
             os._exit(1)
@@ -1125,7 +1125,7 @@ async def run_bot_cycle():
         bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID), ENABLE_TRADING,
         ACCOUNT_BUDGET_USDT, TRADE_SIZE_USDT, MAX_CONCURRENT_TRADES
     )
-    send_telegram("âœ… Wave strategy bot is online (real-time WebSocket, Spot + Alpha).")
+    send_telegram("â Wave strategy bot is online (real-time WebSocket, Spot + Alpha).")
 
     await asyncio.gather(
         spot_ws_loop(spot_symbols),
