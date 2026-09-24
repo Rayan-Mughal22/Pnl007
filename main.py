@@ -119,13 +119,14 @@ BREAKDOWN_EVERY_N_TRADES = 50  # send a performance breakdown after every N clos
 PNL_STATE_PATH = os.environ.get("PNL_STATE_PATH", "pnl_state.json")
 _stats = {"realized_pnl_total": 0.0, "trades_closed": 0, "wins": 0, "losses": 0}
 _stats_message_id = None  # the pinned Telegram message we keep editing
-STATS_MARKER = "STATS_JSON:"
+STATE_VERSION = 3  # fresh strategy state; older pinned/local stats are ignored
+STATS_MARKER = "STATS_JSON_V3:"
 
 
 def _persisted_payload_compact() -> dict:
     """Small payload synced to the pinned Telegram message -- stats + open
     positions only, kept under Telegram's message size limit."""
-    return {"stats": _stats, "open_positions": _open_positions}
+    return {"state_version": STATE_VERSION, "stats": _stats, "open_positions": _open_positions}
 
 
 def _persisted_payload_full() -> dict:
@@ -137,6 +138,8 @@ def _persisted_payload_full() -> dict:
 
 
 def _apply_persisted_payload(data: dict):
+    if data.get("state_version") != STATE_VERSION:
+        return False
     if "stats" in data:
         _stats.update(data["stats"])
     if "open_positions" in data and isinstance(data["open_positions"], dict):
@@ -145,6 +148,7 @@ def _apply_persisted_payload(data: dict):
     if "trade_history" in data and isinstance(data["trade_history"], list):
         _trade_history.clear()
         _trade_history.extend(data["trade_history"])
+    return True
 
 
 def _save_state_local():
@@ -202,7 +206,8 @@ def _load_state_from_telegram() -> bool:
             return False
         json_str = pinned["text"].split(STATS_MARKER, 1)[1].strip()
         loaded = json.loads(json_str)
-        _apply_persisted_payload(loaded)
+        if not _apply_persisted_payload(loaded):
+            return False
         _stats_message_id = pinned.get("message_id")
         return True
     except Exception as e:
@@ -217,9 +222,10 @@ def _load_stats():
     try:
         if os.path.exists(PNL_STATE_PATH):
             with open(PNL_STATE_PATH, "r") as f:
-                _apply_persisted_payload(json.load(f))
-            log.info("State recovered from local backup file: stats=%s | open_positions=%s", _stats, _open_positions)
-            return
+                loaded = json.load(f)
+            if _apply_persisted_payload(loaded):
+                log.info("State recovered from local backup file: stats=%s | open_positions=%s", _stats, _open_positions)
+                return
     except Exception as e:
         log.warning("Could not load local state backup either: %s", e)
     log.info("No prior state found anywhere -- starting fresh: %s", _stats)
@@ -1229,6 +1235,9 @@ async def run_bot_cycle():
 
 def main():
     _load_stats()
+    # Always publish a fresh V3 state message at startup. Older pinned/local
+    # state is intentionally ignored, so the new strategy starts at zero.
+    _sync_state_to_telegram()
     _start_watchdog()
     while True:
         try:
