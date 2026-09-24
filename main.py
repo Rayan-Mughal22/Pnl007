@@ -27,10 +27,10 @@ Pullback: 1-3+ red candles after rally 1. Invalidated if a pullback candle's
           rally's range.
 Entry (rally 2, then rally 3 once more): the INSTANT any green candle's high
          crosses the pullback's first red candle's high (wick included),
-         with volume showing at least some increase vs. the immediately
-         preceding candle -- checked live, not just after candle close.
-Exit: the moment the first red candle appears right after the rally you
-      entered on -- take whatever profit built up.
+         with current volume strictly greater than the immediately preceding candle,
+         RVOL >= 2x, trend and MACD valid at the exact live crossing.
+Exit: the moment the first red candle starts AFTER the entry candle --
+      exit immediately, without waiting for that candle to close.
 
 MONEY MANAGEMENT
 $500 demo budget, $100/trade, max 5 concurrent trades across all coins.
@@ -90,7 +90,7 @@ VOL_MULTIPLIER = 2.0             # RVOL threshold vs. ANY ONE of the MA periods 
 RALLY_MIN_BODY_PCT = 0.4         # min body % for a green rally candle
 PULLBACK_MAX_VOL_RATIO = 0.6     # pullback candle volume must be <= 60% of avg rally candle volume
 INVALIDATION_RETRACE_PCT = 0.30  # pullback retrace vs. rally's range must stay under 30%
-MAX_RALLY_WATCH_CANDLES = 3      # breakout must happen within this many new green candles
+MAX_RALLY_WATCH_CANDLES = None    # no artificial candle-count limit; first crossing wins
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("wavebot")
@@ -103,8 +103,6 @@ TRADE_HISTORY_MAX = 200
 BREAKDOWN_EVERY_N_TRADES = 50  # send a performance breakdown after every N closed trades
 
 # ----------------------------- PERSISTED STATE -----------------------------
-# V2 uses a new state filename + Telegram marker so the previous deployment
-# history is intentionally ignored. From this deployment onward, stats persist.
 # Everything above is in-memory only, which is wiped on every restart --
 # including the watchdog's own restarts, and every time new code is
 # deployed (Railway's disk is NOT persisted across redeploys without a paid
@@ -118,10 +116,10 @@ BREAKDOWN_EVERY_N_TRADES = 50  # send a performance breakdown after every N clos
 # performance breakdown) and only financially-inert analytics, so it's only
 # persisted to the local JSON file backup -- fine for same-deployment
 # restarts, may reset on a full redeploy, which doesn't matter financially.
-PNL_STATE_PATH = os.environ.get("PNL_STATE_PATH", "pnl_state_fresh_v2.json")
+PNL_STATE_PATH = os.environ.get("PNL_STATE_PATH", "pnl_state.json")
 _stats = {"realized_pnl_total": 0.0, "trades_closed": 0, "wins": 0, "losses": 0}
 _stats_message_id = None  # the pinned Telegram message we keep editing
-STATS_MARKER = "STATS_JSON_FRESH_V2:"
+STATS_MARKER = "STATS_JSON:"
 
 
 def _persisted_payload_compact() -> dict:
@@ -224,7 +222,7 @@ def _load_stats():
             return
     except Exception as e:
         log.warning("Could not load local state backup either: %s", e)
-    log.info("No prior V2 state found -- starting fresh: %s", _stats)
+    log.info("No prior state found anywhere -- starting fresh: %s", _stats)
 
 
 def _save_stats():
@@ -401,14 +399,29 @@ def _rvol_ok_against(volume, vol_ma_lookup) -> bool:
     return False
 
 
-def _breakout_confirmed(high, volume, pullback_first_high, prev_volume, vol_ma_lookup=None) -> bool:
-    if high <= pullback_first_high:
+def _breakout_confirmed(price, open_price, volume, pullback_first_high, prev_volume,
+                        vol_ma_lookup=None, trend_ok=True, macd_ok=True) -> bool:
+    """Exact one-shot breakout gate.
+
+    The first live tick that crosses the pullback's first red candle high is
+    the ONLY decision point. At that exact crossing we require a green candle,
+    rising volume, RVOL >= 2x, bullish trend stack and MACD above signal.
+    """
+    # The wick/high is what performs the breakout. The live price at that
+    # crossing tick must also be above the candle open, so the breakout candle
+    # is green at the instant the wick crosses the pullback high.
+    if price <= pullback_first_high:
         return False
-    if prev_volume is None or volume <= prev_volume:
+    if price <= open_price:
+        return False
+    if prev_volume is not None and volume <= prev_volume:
         return False
     if not _rvol_ok_against(volume, vol_ma_lookup):
         return False
+    if not trend_ok or not macd_ok:
+        return False
     return True
+
 
 def _entry_detail(row) -> dict:
     period, ratio = _best_rvol_ratio(row)
@@ -442,115 +455,180 @@ def _detail_line(detail: dict) -> str:
     )
 
 
-
-# ----------------------------- LIVE INDICATORS -------------------------------
-def _best_rvol_ratio_from_values(volume, vol_ma_lookup):
-    best_period, best_ratio = None, 0.0
-    for p in VOL_MA_PERIODS:
-        ma = vol_ma_lookup.get(p) if vol_ma_lookup else None
-        if ma and ma > 0:
-            ratio = float(volume) / float(ma)
-            if ratio > best_ratio:
-                best_period, best_ratio = p, ratio
-    return best_period, best_ratio
-
-
-def _live_indicator_row(state, o, h, l, c, v):
-    df = state['df']
-    if df is None or len(df) < 210:
-        return None
-    closes = pd.concat([df['close'], pd.Series([float(c)])], ignore_index=True)
-    ema9 = closes.ewm(span=9, adjust=False).mean().iloc[-1]
-    ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
-    ema200 = closes.ewm(span=200, adjust=False).mean().iloc[-1]
-    typical = (df['high'] + df['low'] + df['close']) / 3.0
-    base_vol = float(df['volume'].sum())
-    base_vp = float((typical * df['volume']).sum())
-    live_typical = (float(h) + float(l) + float(c)) / 3.0
-    total_vol = base_vol + float(v)
-    vwap = (base_vp + live_typical * float(v)) / total_vol if total_vol > 0 else float(df.iloc[-1]['vwap'])
-    ema12 = closes.ewm(span=12, adjust=False).mean()
-    ema26 = closes.ewm(span=26, adjust=False).mean()
-    macd_series = ema12 - ema26
-    macd = float(macd_series.iloc[-1])
-    macd_signal = float(macd_series.ewm(span=9, adjust=False).mean().iloc[-1])
-    vol_ma_lookup = {p: (float(df['volume'].tail(p).mean()) if not pd.isna(df['volume'].tail(p).mean()) else None) for p in VOL_MA_PERIODS}
-    return {
-        'ema9': float(ema9), 'ema20': float(ema20), 'ema200': float(ema200), 'vwap': float(vwap),
-        'macd': macd, 'macd_signal': macd_signal, 'macd_above_signal': macd > macd_signal,
-        'trend_ok': ema9 > ema20 > vwap > ema200, 'vol_ma_lookup': vol_ma_lookup,
-    }
-
 # ----------------------------- WAVE STATE MACHINE --------------------------
 def run_state_machine(df: pd.DataFrame):
-    """Build a future live-breakout watch from CLOSED candles only."""
+    """
+    Rebuilds the whole rally/pullback/breakout sequence from CLOSED candles
+    only (the newest row in df is assumed already closed -- this is called
+    right after a candle-close event, never on a live/forming candle).
+
+    Returns (entry_or_None, watch_state_or_None):
+      entry: (stage, price, candle_key, detail) if a breakout completed
+              exactly on the newest closed candle.
+      watch_state: {"pullback_first_high":, "prev_volume":, "stage":} if the
+              state machine ended in WATCH_BREAKOUT (waiting for a breakout),
+              so the caller can cheaply check future live ticks against it.
+    """
     n = len(df)
     if n < 210:
         return None, None
+
     last_idx = n - 1
     start_idx = max(0, n - 260)
-    phase = 'WAIT_RALLY1'
+
+    phase = "WAIT_RALLY1"
     rally_candles = []
     rally_range = None
     pullback_candles = []
     pullback_first_high = None
     pullback_max_retrace_pct = 0.0
     watch_candles = []
-    stage = None
+    stage_after_pullback = None
+    entry_index = None
+    entry_stage = None
+    entry_price = None
+    entry_detail = None
+
     for i in range(start_idx, last_idx + 1):
         row = df.iloc[i]
-        green = row['close'] > row['open']
-        red = row['close'] < row['open']
-        body = abs(row['body_pct'])
-        if phase == 'WAIT_RALLY1':
-            if green and body >= RALLY_MIN_BODY_PCT:
-                if rally_candles and row['volume'] <= rally_candles[-1]['volume']:
+        is_green = row["close"] > row["open"]
+        is_red = row["close"] < row["open"]
+        body_pct = abs(row["body_pct"])
+
+        if phase == "WAIT_RALLY1":
+            if is_green and body_pct >= RALLY_MIN_BODY_PCT:
+                if rally_candles and row["volume"] < rally_candles[-1]["volume"]:
                     rally_candles = [row]
                 else:
                     rally_candles.append(row)
                 if len(rally_candles) >= 2 and _trend_ok(row) and _rvol_ok(row) and _macd_ok(row):
-                    rally_range = (min(x['low'] for x in rally_candles), max(x['high'] for x in rally_candles))
-                    phase = 'PULLBACK'
+                    rally_range = (min(c["low"] for c in rally_candles), max(c["high"] for c in rally_candles))
+                    phase = "PULLBACK"
                     pullback_candles = []
                     pullback_max_retrace_pct = 0.0
-                    stage = 'rally2'
+                    stage_after_pullback = "rally2"
             else:
                 rally_candles = []
-        elif phase == 'PULLBACK':
-            if red:
+
+        elif phase == "PULLBACK":
+            if is_red:
                 pullback_candles.append(row)
-                size = rally_range[1] - rally_range[0]
-                retrace = (rally_range[1] - row['low']) / size if size > 0 else 0
-                pullback_max_retrace_pct = max(pullback_max_retrace_pct, retrace)
-                avg_rally_vol = _avg_vol(rally_candles)
-                if retrace >= INVALIDATION_RETRACE_PCT or (avg_rally_vol > 0 and row['volume'] >= PULLBACK_MAX_VOL_RATIO * avg_rally_vol):
-                    phase = 'WAIT_RALLY1'; rally_candles = []
-            elif green:
+                r_high, r_low = rally_range[1], rally_range[0]
+                r_size = r_high - r_low
+                retrace = r_high - row["low"]
+                retrace_pct = (retrace / r_size) if r_size > 0 else 0
+                pullback_max_retrace_pct = max(pullback_max_retrace_pct, retrace_pct)
+                rally_avg_vol = _avg_vol(rally_candles)
+                too_deep = retrace_pct >= INVALIDATION_RETRACE_PCT
+                too_heavy = rally_avg_vol > 0 and row["volume"] >= PULLBACK_MAX_VOL_RATIO * rally_avg_vol
+                if too_deep or too_heavy:
+                    phase = "WAIT_RALLY1"
+                    rally_candles = []
+            elif is_green:
                 if not pullback_candles:
-                    rally_candles.append(row)
+                    if body_pct >= RALLY_MIN_BODY_PCT and (not rally_candles or row["volume"] > rally_candles[-1]["volume"]):
+                        rally_candles.append(row)
+                        rally_range = (min(c["low"] for c in rally_candles), max(c["high"] for c in rally_candles))
+                    else:
+                        phase = "WAIT_RALLY1"
+                        rally_candles = []
                 else:
-                    pullback_first_high = pullback_candles[0]['high']
+                    pullback_first_high = pullback_candles[0]["high"]
                     watch_candles = [row]
-                    phase = 'WATCH_BREAKOUT'
-            else:
-                phase = 'WAIT_RALLY1'; rally_candles = []
-        elif phase == 'WATCH_BREAKOUT':
-            if green:
+                    if row["high"] > pullback_first_high:
+                        # Price crosses the level for the very first time on
+                        # THIS candle -- this is the one-and-only breakout
+                        # judgment moment. If conditions (volume-rising,
+                        # RVOL) aren't ALSO met right here, the setup is
+                        # dead -- do NOT keep re-checking later candles
+                        # against this same already-broken level (that would
+                        # mean entering well after the real breakout, at a
+                        # worse price than the actual crossing).
+                        if _breakout_confirmed(row["high"], row["open"], row["volume"], pullback_first_high, pullback_candles[-1]["volume"], _row_vol_ma_lookup(row), _trend_ok(row), _macd_ok(row)):
+                            entry_index = i
+                            entry_stage = stage_after_pullback
+                            entry_price = row["close"]
+                            entry_detail = _entry_detail(row)
+                            entry_detail["pullback_retrace_pct"] = pullback_max_retrace_pct * 100
+                            if stage_after_pullback == "rally2":
+                                rally_range = (min(c["low"] for c in watch_candles), max(c["high"] for c in watch_candles))
+                                rally_candles = list(watch_candles)
+                                phase = "PULLBACK"
+                                pullback_candles = []
+                                pullback_max_retrace_pct = 0.0
+                                stage_after_pullback = "rally3"
+                            else:
+                                phase = "WAIT_RALLY1"
+                                rally_candles = []
+                        else:
+                            phase = "WAIT_RALLY1"
+                            rally_candles = []
+                    else:
+                        # Hasn't reached the level yet -- keep watching for
+                        # the candle that actually crosses it.
+                        phase = "WATCH_BREAKOUT"
+
+        elif phase == "WATCH_BREAKOUT":
+            if is_green:
                 watch_candles.append(row)
-                if row['high'] > pullback_first_high:
-                    phase = 'WAIT_RALLY1'; rally_candles = []
-            elif red:
-                phase = 'WAIT_RALLY1'; rally_candles = []
-    if phase == 'WATCH_BREAKOUT':
-        last = watch_candles[-1] if watch_candles else pullback_candles[-1]
-        return None, {
-            'pullback_first_high': float(pullback_first_high),
-            'prev_volume': float(last['volume']),
-            'stage': stage,
-            'vol_ma_lookup': _row_vol_ma_lookup(last),
-            'pullback_retrace_pct': pullback_max_retrace_pct * 100,
+                if row["high"] > pullback_first_high:
+                    # First candle to cross the level -- one-shot judgment,
+                    # same rule as above: pass now or the setup is dead.
+                    prev_vol = watch_candles[-2]["volume"] if len(watch_candles) >= 2 else pullback_candles[-1]["volume"]
+                    if _breakout_confirmed(row["high"], row["open"], row["volume"], pullback_first_high, prev_vol, _row_vol_ma_lookup(row), _trend_ok(row), _macd_ok(row)):
+                        entry_index = i
+                        entry_stage = stage_after_pullback
+                        entry_price = row["close"]
+                        entry_detail = _entry_detail(row)
+                        entry_detail["pullback_retrace_pct"] = pullback_max_retrace_pct * 100
+                        if stage_after_pullback == "rally2":
+                            rally_range = (min(c["low"] for c in watch_candles), max(c["high"] for c in watch_candles))
+                            rally_candles = list(watch_candles)
+                            phase = "PULLBACK"
+                            pullback_candles = []
+                            pullback_max_retrace_pct = 0.0
+                            stage_after_pullback = "rally3"
+                        else:
+                            phase = "WAIT_RALLY1"
+                            rally_candles = []
+                    else:
+                        phase = "WAIT_RALLY1"
+                        rally_candles = []
+            elif is_red:
+                phase = "WAIT_RALLY1"
+                rally_candles = []
+
+    entry_result = None
+    if entry_index == last_idx:
+        candle_key = df.iloc[last_idx]["open_time"]
+        entry_result = (entry_stage, entry_price, candle_key, entry_detail)
+
+    watch_state = None
+    # IMPORTANT: arm the live breakout watcher immediately after a valid
+    # pullback candle closes. The NEXT candle is the first opportunity to
+    # cross the first red candle's high, and we must not wait for that green
+    # candle to close. This is what makes entry truly real-time.
+    if pullback_candles and phase in ("PULLBACK", "WATCH_BREAKOUT"):
+        last_row = pullback_candles[-1]
+        watch_state = {
+            "pullback_first_high": pullback_candles[0]["high"],
+            "prev_volume": last_row["volume"],
+            "stage": stage_after_pullback,
+            "vol_ma_lookup": _row_vol_ma_lookup(last_row),
+            "pullback_retrace_pct": pullback_max_retrace_pct * 100,
         }
-    return None, None
+    elif phase == "WATCH_BREAKOUT":
+        last_row = watch_candles[-1] if watch_candles else df.iloc[last_idx]
+        watch_state = {
+            "pullback_first_high": pullback_first_high,
+            "prev_volume": last_row["volume"],
+            "stage": stage_after_pullback,
+            "vol_ma_lookup": _row_vol_ma_lookup(last_row),
+            "pullback_retrace_pct": pullback_max_retrace_pct * 100,
+        }
+
+    return entry_result, watch_state
+
 
 def check_exit_row(row) -> bool:
     """Exit rule: get out the moment the first red candle appears right
@@ -586,35 +664,40 @@ def total_open_trades() -> int:
     return sum(len(v) for v in _open_positions.values())
 
 
-def open_long(symbol: str, stage: str, detail: dict = None, entry_candle_open_time=None):
+def open_long(symbol: str, stage: str, detail: dict = None):
     if total_open_trades() >= MAX_CONCURRENT_TRADES:
+        log.info("Budget full (%d/%d trades) -- skipping %s entry on %s",
+                  total_open_trades(), MAX_CONCURRENT_TRADES, stage, symbol)
         return
-    resp = _signed_request('POST', '/api/v3/order', {
-        'symbol': symbol, 'side': 'BUY', 'type': 'MARKET', 'quoteOrderQty': TRADE_SIZE_USDT,
+    resp = _signed_request("POST", "/api/v3/order", {
+        "symbol": symbol, "side": "BUY", "type": "MARKET",
+        "quoteOrderQty": TRADE_SIZE_USDT,
     })
-    if not resp or 'executedQty' not in resp:
-        log.error('ENTRY FAILED %s [%s]: %s', symbol, stage, resp)
+    if not resp or "executedQty" not in resp:
+        log.error("Failed to open long on %s: %s", symbol, resp)
         return
-    qty = float(resp['executedQty'])
-    quote_spent = float(resp.get('cummulativeQuoteQty', TRADE_SIZE_USDT))
+    qty = float(resp["executedQty"])
+    quote_spent = float(resp.get("cummulativeQuoteQty", TRADE_SIZE_USDT))
     if qty <= 0:
         return
     entry_price = quote_spent / qty
     entry_fee = quote_spent * FEE_RATE
+    if symbol in _symbol_state:
+        _symbol_state[symbol]["exit_in_progress"] = False
     _open_positions.setdefault(symbol, []).append({
-        'qty': qty, 'entry_price': entry_price, 'entry_fee': entry_fee,
-        'entry_time': time.time(), 'entry_candle_open_time': entry_candle_open_time, 'stage': stage,
-        'breakout_level': detail.get('breakout_level') if detail else None,
-        'entry_rvol_ratio': detail.get('rvol_ratio') if detail else None,
-        'entry_rvol_period': detail.get('rvol_period') if detail else None,
-        'breakout_rvol': detail.get('breakout_rvol') if detail else None,
-        'entry_retrace_pct': detail.get('pullback_retrace_pct') if detail else None,
+        "qty": qty, "entry_price": entry_price, "entry_fee": entry_fee,
+        "entry_time": time.time(), "entry_candle_open_time": detail.get("entry_candle_open_time") if detail else None, "stage": stage,
+        "entry_rvol_ratio": detail.get("rvol_ratio") if detail else None,
+        "entry_rvol_period": detail.get("rvol_period") if detail else None,
+        "breakout_rvol_ratio": detail.get("breakout_rvol_ratio") if detail else None,
+        "breakout_rvol_period": detail.get("breakout_rvol_period") if detail else None,
+        "entry_retrace_pct": detail.get("pullback_retrace_pct") if detail else None,
     })
-    _save_stats()
-    log.info('TRADE ENTRY %s [%s] | Entry Price=%.8f | RVOL MA=%s | Entry RVOL=%.2fx | Breakout RVOL=%.2fx | Retracement=%.1f%%',
-             symbol, stage, entry_price, detail.get('rvol_period') if detail else None,
-             detail.get('rvol_ratio', 0) if detail else 0, detail.get('breakout_rvol', 0) if detail else 0,
-             detail.get('pullback_retrace_pct', 0) if detail else 0)
+    _save_stats()  # persist the newly-opened position immediately -- don't wait for it to close
+    detail_str = f" | {_detail_line(detail)}" if detail else ""
+    log.info("TRADE OPEN  %s [%s] | qty=%.6f entry=%.6f cost=%.2f USDT (fee ~%.3f) | open trades=%d/%d%s",
+              symbol, stage, qty, entry_price, quote_spent, entry_fee, total_open_trades(), MAX_CONCURRENT_TRADES, detail_str)
+
 
 def _bucket_rvol(ratio):
     if ratio is None:
@@ -667,12 +750,12 @@ def _compute_breakdown() -> str:
     if not records:
         return "Ã°ÂŸÂ“ÂŠ PERFORMANCE BREAKDOWN: no trade history yet."
 
-    rvol_section = _summarize_bucket(records, lambda r: _bucket_rvol(r.get("rvol_ratio")), "RVOL magnitude")
+    rvol_section = _summarize_bucket(records, lambda r: _bucket_rvol(r.get("rvol_ratio")), "Entry RVOL magnitude")
+    breakout_rvol_section = _summarize_bucket(records, lambda r: _bucket_rvol(r.get("breakout_rvol")), "Breakout RVOL magnitude")
     period_section = _summarize_bucket(
         records, lambda r: f"{r['rvol_period']}-period" if r.get("rvol_period") else None, "RVOL period matched"
     )
     retrace_section = _summarize_bucket(records, lambda r: _bucket_retrace(r.get("retrace_pct")), "pullback retracement")
-    breakout_rvol_section = _summarize_bucket(records, lambda r: _bucket_rvol(r.get("breakout_rvol")), "breakout RVOL")
 
     total = len(records)
     wins = sum(1 for r in records if r["win"])
@@ -681,57 +764,70 @@ def _compute_breakdown() -> str:
 
     return (
         f"Ã°ÂŸÂ“ÂŠ PERFORMANCE BREAKDOWN (last {total} trades)\n\n"
-        f"{rvol_section}\n\n{period_section}\n\n{breakout_rvol_section}\n\n{retrace_section}\n\n"
+        f"{rvol_section}\n\n{breakout_rvol_section}\n\n{period_section}\n\n{retrace_section}\n\n"
         f"Overall: {total} trades, {win_rate:.1f}% win rate, total pnl {total_pnl:+.2f} USDT"
     )
 
 
-def close_all_for_symbol(symbol: str, trigger_price=None, trigger_time=None):
+def close_all_for_symbol(symbol: str):
     positions = _open_positions.get(symbol)
     if not positions:
         return
     for pos in positions:
-        resp = _signed_request('POST', '/api/v3/order', {
-            'symbol': symbol, 'side': 'SELL', 'type': 'MARKET',
-            'quantity': f"{pos['qty']:.8f}".rstrip('0').rstrip('.'),
+        resp = _signed_request("POST", "/api/v3/order", {
+            "symbol": symbol, "side": "SELL", "type": "MARKET",
+            "quantity": f"{pos['qty']:.8f}".rstrip("0").rstrip("."),
         })
-        if not resp or 'executedQty' not in resp:
-            log.error('EXIT FAILED %s: %s', symbol, resp)
+        if not resp or "executedQty" not in resp:
+            log.error("Failed to close long on %s: %s", symbol, resp)
             continue
-        qty_sold = float(resp['executedQty'])
-        quote_received = float(resp.get('cummulativeQuoteQty', 0))
-        exit_price = quote_received / qty_sold if qty_sold else (trigger_price or 0)
+        qty_sold = float(resp["executedQty"])
+        quote_received = float(resp.get("cummulativeQuoteQty", 0))
+        exit_price = quote_received / qty_sold if qty_sold else 0
         exit_fee = quote_received * FEE_RATE
-        cost_basis = pos['qty'] * pos['entry_price']
+        cost_basis = pos["qty"] * pos["entry_price"]
         gross_pnl = quote_received - cost_basis
-        total_fees = pos.get('entry_fee', 0) + exit_fee
+        total_fees = pos.get("entry_fee", 0) + exit_fee
         pnl = gross_pnl - total_fees
-        _stats['realized_pnl_total'] += pnl
-        _stats['trades_closed'] += 1
-        _stats['wins' if pnl >= 0 else 'losses'] += 1
+        _stats["realized_pnl_total"] += pnl
+        _stats["trades_closed"] += 1
+        win = pnl >= 0
+        if win:
+            _stats["wins"] += 1
+        else:
+            _stats["losses"] += 1
+
         _trade_history.append({
-            'symbol': symbol, 'stage': pos['stage'], 'pnl': pnl, 'win': pnl >= 0,
-            'rvol_ratio': pos.get('entry_rvol_ratio'), 'rvol_period': pos.get('entry_rvol_period'),
-            'breakout_rvol': pos.get('breakout_rvol'), 'retrace_pct': pos.get('entry_retrace_pct'),
+            "symbol": symbol, "stage": pos["stage"], "pnl": pnl, "win": win,
+            "rvol_ratio": pos.get("entry_rvol_ratio"),
+            "rvol_period": pos.get("entry_rvol_period"),
+            "breakout_rvol": pos.get("breakout_rvol_ratio", pos.get("entry_rvol_ratio")),
+            "retrace_pct": pos.get("entry_retrace_pct"),
         })
         if len(_trade_history) > TRADE_HISTORY_MAX:
-            del _trade_history[:len(_trade_history)-TRADE_HISTORY_MAX]
+            del _trade_history[:len(_trade_history) - TRADE_HISTORY_MAX]
+
         _save_stats()
-        wr = _stats['wins'] / _stats['trades_closed'] * 100 if _stats['trades_closed'] else 0
-        msg = (f"{'ðŸŸ¢' if pnl >= 0 else 'ðŸ”´'} TRADE EXIT {symbol} [{pos['stage']}]\n"
-               f"Entry Price: {pos['entry_price']:.8f}\nExit Price: {exit_price:.8f}\n"
-               f"Gross Profit/Loss: {gross_pnl:+.4f} USDT\nBinance Fees: {total_fees:.4f} USDT\n"
-               f"Net Profit/Loss: {pnl:+.4f} USDT\nOverall Profit/Loss: {_stats['realized_pnl_total']:+.4f} USDT\n"
-               f"RVOL MA: {pos.get('entry_rvol_period')} | Entry RVOL: {pos.get('entry_rvol_ratio',0):.2f}x | "
-               f"Breakout RVOL: {pos.get('breakout_rvol',0):.2f}x | Retracement: {pos.get('entry_retrace_pct',0):.1f}%\n"
-               f"Trades: {_stats['trades_closed']} | W:{_stats['wins']} L:{_stats['losses']} | Win rate: {wr:.1f}%")
-        log.info(msg.replace(chr(10), ' | '))
-        send_telegram(msg)
-        if _stats['trades_closed'] % BREAKDOWN_EVERY_N_TRADES == 0:
-            breakdown = _compute_breakdown()
-            log.info(breakdown.replace(chr(10), ' | '))
-            send_telegram(breakdown)
+        hold_minutes = (time.time() - pos["entry_time"]) / 60
+        win_rate = (_stats["wins"] / _stats["trades_closed"] * 100) if _stats["trades_closed"] else 0
+        close_msg = (
+            f"{'Ã°ÂŸÂŸÂ¢' if pnl >= 0 else 'Ã°ÂŸÂ”Â´'} TRADE CLOSE {symbol} [{pos['stage']}]\n"
+            f"Entry: {pos['entry_price']:.6f} | Exit: {exit_price:.6f}\n"
+            f"This trade: gross={gross_pnl:.2f} fees={total_fees:.2f} net={pnl:.2f} USDT ({hold_minutes:.1f} min held)\n"
+            f"Lifetime: total PnL={_stats['realized_pnl_total']:.2f} USDT | "
+            f"{_stats['trades_closed']} trades (W:{_stats['wins']} L:{_stats['losses']}, {win_rate:.1f}% win rate)"
+        )
+        log.info(close_msg.replace(chr(10), " | "))
+        send_telegram(close_msg)
+
+        if _stats["trades_closed"] % BREAKDOWN_EVERY_N_TRADES == 0:
+            breakdown_msg = _compute_breakdown()
+            log.info(breakdown_msg.replace(chr(10), " | "))
+            send_telegram(breakdown_msg)
     del _open_positions[symbol]
+    if symbol in _symbol_state:
+        _symbol_state[symbol]["exit_in_progress"] = False
+
 
 def log_portfolio_summary(also_telegram: bool = False):
     win_rate = (_stats["wins"] / _stats["trades_closed"] * 100) if _stats["trades_closed"] else 0
@@ -815,7 +911,7 @@ def seed_symbol(key: str, tradeable: bool, fetch_symbol: str = None):
     # machine finds in old history, only store it so live ticks going
     # forward can react to genuinely NEW breakouts.
     _, watch_state = run_state_machine(df)
-    _symbol_state[key] = {"df": df, "tradeable": tradeable, "watch": watch_state}
+    _symbol_state[key] = {"df": df, "tradeable": tradeable, "watch": watch_state, "exit_in_progress": False}
 
 
 def seed_all_symbols(spot_symbols, alpha_tokens):
@@ -833,143 +929,163 @@ def seed_all_symbols(spot_symbols, alpha_tokens):
                 f.result(timeout=30)
             except Exception as e:
                 log.warning("Seed error: %s", e)
+    log.info("Seeding complete. %d symbols loaded.", len(_symbol_state))
 
 
 def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
     state = _symbol_state.get(symbol)
     if state is None:
-        return
+        return  # not seeded (shouldn't normally happen)
+    df = state["df"]
     new_row = pd.DataFrame([{
-        'open_time': open_time, 'open': o, 'high': h, 'low': l, 'close': c, 'volume': v,
-        'close_time': close_time, 'quote_asset_volume': 0, 'num_trades': 0,
-        'taker_buy_base': 0, 'taker_buy_quote': 0, 'ignore': 0,
+        "open_time": open_time, "open": o, "high": h, "low": l, "close": c,
+        "volume": v, "close_time": close_time, "quote_asset_volume": 0,
+        "num_trades": 0, "taker_buy_base": 0, "taker_buy_quote": 0, "ignore": 0,
     }])
-    df = pd.concat([state['df'][['open_time','open','high','low','close','volume','close_time','quote_asset_volume','num_trades','taker_buy_base','taker_buy_quote','ignore']], new_row], ignore_index=True)
+    # Replace the last row if it's the SAME candle (shouldn't be, since this
+    # is only called on closed candles), otherwise append and trim.
+    df = pd.concat([df[["open_time", "open", "high", "low", "close", "volume",
+                        "close_time", "quote_asset_volume", "num_trades",
+                        "taker_buy_base", "taker_buy_quote", "ignore"]], new_row], ignore_index=True)
     if len(df) > MAX_HISTORY_ROWS:
         df = df.iloc[-MAX_HISTORY_ROWS:].reset_index(drop=True)
-    state['df'] = add_indicators(df)
-    # Never execute an old breakout at candle close. This only prepares the next live watch.
-    _, state['watch'] = run_state_machine(state['df'])
+    df = add_indicators(df)
+    state["df"] = df
 
-def _live_rvol_detail(volume, vol_ma_lookup, live):
-    period, ratio = _best_rvol_ratio_from_values(volume, vol_ma_lookup)
+    entry_result, watch_state = run_state_machine(df)
+    state["watch"] = watch_state
+    if entry_result:
+        _run_bg(_signal_and_maybe_trade, symbol, state["tradeable"], entry_result)
+
+    if state["tradeable"] and symbol in _open_positions:
+        last_row = df.iloc[-1]
+        if check_exit_row(last_row):
+            _run_bg(close_all_for_symbol, symbol)
+
+
+def _live_indicator_snapshot(state: dict, close: float, volume: float) -> dict:
+    """Build indicators for the current forming 5m candle without waiting
+    for candle close. Used only for a symbol that is already in WATCH state."""
+    df = state["df"]
+    last = df.iloc[-1]
+    row = {
+        "open_time": last["open_time"],
+        "open": last["close"],
+        "high": close,
+        "low": close,
+        "close": close,
+        "volume": volume,
+        "close_time": last["close_time"],
+        "quote_asset_volume": 0, "num_trades": 0,
+        "taker_buy_base": 0, "taker_buy_quote": 0, "ignore": 0,
+    }
+    tmp = pd.concat([df.iloc[-MAX_HISTORY_ROWS + 1:].copy(), pd.DataFrame([row])], ignore_index=True)
+    tmp = add_indicators(tmp)
+    return tmp.iloc[-1]
+
+
+def _live_rvol_detail(volume, vol_ma_lookup, live_row) -> dict:
+    """RVOL from the live forming candle volume against the stored closed-candle
+    volume-MA references; trend/MACD come from the live-price indicator row."""
+    best_period, best_ratio = None, 0.0
+    if vol_ma_lookup:
+        for p in VOL_MA_PERIODS:
+            ma = vol_ma_lookup.get(p)
+            if ma is not None and not math.isnan(ma) and ma > 0:
+                ratio = volume / ma
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_period = p
     return {
-        'rvol_ratio': ratio, 'rvol_period': period,
-        'macd': live['macd'], 'macd_signal': live['macd_signal'],
-        'macd_above_signal': live['macd_above_signal'], 'ema9': live['ema9'],
-        'ema20': live['ema20'], 'vwap': live['vwap'], 'ema200': live['ema200'],
+        "rvol_ratio": best_ratio,
+        "rvol_period": best_period,
+        "macd": live_row["macd"],
+        "macd_signal": live_row["macd_signal"],
+        "macd_above_signal": live_row["macd"] > live_row["macd_signal"],
+        "ema9": live_row["ema9"],
+        "ema20": live_row["ema20"],
+        "vwap": live_row["vwap"],
+        "ema200": live_row["ema200"],
     }
 
-def on_live_tick(symbol: str, o: float, high: float, low: float, close: float, volume: float, open_time):
+
+def _entry_gate_detail(state: dict, watch: dict, price: float, open_price: float, volume: float):
+    live_row = _live_indicator_snapshot(state, price, volume)
+    detail = _live_rvol_detail(volume, watch.get("vol_ma_lookup"), live_row)
+    detail["pullback_retrace_pct"] = watch.get("pullback_retrace_pct", 0.0)
+    trend_ok = _trend_ok(live_row)
+    macd_ok = _macd_ok(live_row)
+    confirmed = _breakout_confirmed(
+        price, open_price, volume, watch["pullback_first_high"],
+        watch.get("prev_volume"), watch.get("vol_ma_lookup"), trend_ok, macd_ok
+    )
+    detail["breakout_rvol_ratio"] = detail["rvol_ratio"]
+    detail["breakout_rvol_period"] = detail["rvol_period"]
+    detail["trend_ok_at_breakout"] = trend_ok
+    detail["macd_ok_at_breakout"] = macd_ok
+    return confirmed, detail
+
+
+def on_live_tick(symbol: str, open_price: float, high: float, close: float, volume: float, open_time):
     state = _symbol_state.get(symbol)
     if state is None:
         return
 
-    # Keep a small live state for the wave that was just traded.  It allows the
-    # next pullback/breakout to become RALLY 3 without waiting for a full
-    # historical reconstruction that would otherwise lose the live entry.
-    after = state.get('after_entry')
-
-    # EXIT: first NEW red candle after the entry candle starts -> immediate sell.
-    if state['tradeable'] and symbol in _open_positions:
-        for pos in list(_open_positions.get(symbol, [])):
-            if open_time > pos.get('entry_candle_open_time', -1) and close < o:
-                # The red candle is also the first pullback candle for Rally 3.
-                if after and after.get('stage') == 'rally2':
-                    rally_hi = max(after.get('high', high), high)
-                    rally_lo = after.get('low', low)
-                    rally_size = rally_hi - rally_lo
-                    retrace = (rally_hi - low) / rally_size if rally_size > 0 else 0
-                    avg_vol = after.get('volume', volume)
-                    if retrace < INVALIDATION_RETRACE_PCT and volume < PULLBACK_MAX_VOL_RATIO * avg_vol:
-                        state['rally3_pullback'] = {
-                            'first_high': high,
-                            'retrace_pct': retrace * 100,
-                            'rally_high': rally_hi,
-                            'rally_low': rally_lo,
-                            'rally_avg_vol': avg_vol,
-                            'prev_volume': volume,
-                        }
-                    else:
-                        state['rally3_pullback'] = None
-                    state['after_entry'] = None
-                _run_bg(close_all_for_symbol, symbol, close, open_time)
-                return
-
-    # Continue building the post-Rally-2 wave while no position is open.
-    pull3 = state.get('rally3_pullback')
-    if pull3 and open_time >= state.get('rally3_watch_candle', open_time):
-        # Additional red pullback candles deepen the retracement; invalidate if
-        # the 30% ceiling or 60%-of-rally-volume ceiling is reached.
-        if close < o:
-            size = pull3['rally_high'] - pull3['rally_low']
-            retrace = (pull3['rally_high'] - low) / size if size > 0 else 0
-            pull3['retrace_pct'] = max(pull3['retrace_pct'], retrace * 100)
-            if retrace >= INVALIDATION_RETRACE_PCT or volume >= PULLBACK_MAX_VOL_RATIO * pull3['rally_avg_vol']:
-                state['rally3_pullback'] = None
-            else:
-                pull3['prev_volume'] = volume
-            return
-        if close > o:
-            state['watch'] = {
-                'pullback_first_high': pull3['first_high'],
-                'prev_volume': pull3['prev_volume'],
-                'stage': 'rally3',
-                'vol_ma_lookup': _row_vol_ma_lookup(state['df'].iloc[-1]),
-                'pullback_retrace_pct': pull3['retrace_pct'],
-            }
-            state['rally3_pullback'] = None
-            # Continue below so this very first Rally-3 green candle can itself
-            # be the one-shot breakout candle if it crosses the first red high.
-            pull3 = None
-
-    watch = state.get('watch')
-    if not watch or high <= watch['pullback_first_high']:
-        # If an entry just happened, keep the current candle as Rally 2.
-        if state.get('after_entry') and open_time == state['after_entry'].get('open_time'):
-            state['after_entry']['high'] = max(state['after_entry']['high'], high)
-            state['after_entry']['low'] = min(state['after_entry']['low'], low)
-            state['after_entry']['volume'] = volume
+    # EXIT is checked first. The moment the currently forming candle turns
+    # red, close the live Spot position -- do NOT wait for candle close.
+    if state["tradeable"] and symbol in _open_positions and close < open_price:
+        positions = _open_positions.get(symbol, [])
+        # Exit only on the FIRST red candle AFTER the candle on which entry
+        # occurred. Never exit merely because the entry candle later turns red.
+        eligible = any(p.get("entry_candle_open_time") is not None and
+                       p.get("entry_candle_open_time") != open_time for p in positions)
+        if eligible and not state.get("exit_in_progress"):
+            state["exit_in_progress"] = True
+            _run_bg(close_all_for_symbol, symbol)
         return
 
-    # Exact one-shot breakout moment: evaluate every condition NOW.
-    live = _live_indicator_row(state, o, high, low, close, volume)
-    if not live:
-        return
-    if not (_breakout_confirmed(high, volume, watch['pullback_first_high'], watch['prev_volume'], live['vol_ma_lookup'])
-            and live['trend_ok'] and live['macd_above_signal']):
-        state['watch'] = None
-        state['rally3_pullback'] = None
+    watch = state.get("watch")
+    if not watch:
         return
 
-    stage = watch['stage']
+    # Detect the EXACT LIVE crossing tick. The breakout level is crossed by
+    # the candle HIGH/WICK, not by requiring the candle to CLOSE above it.
+    # We remember the highest live price seen so far in this candle so a
+    # later tick cannot falsely become the "breakout" decision point.
+    breakout_level = watch["pullback_first_high"]
+    previous_live_high = watch.get("last_live_high", breakout_level)
+    crossed_now = previous_live_high <= breakout_level and high > breakout_level
+    if high > previous_live_high:
+        watch["last_live_high"] = high
+    if not crossed_now:
+        return
+
     candle_key = open_time
+    stage = watch["stage"]
     if _entry_already_taken(symbol, stage, candle_key):
         return
-    detail = _live_rvol_detail(volume, live['vol_ma_lookup'], live)
-    detail['pullback_retrace_pct'] = watch.get('pullback_retrace_pct', 0.0)
-    detail['breakout_level'] = watch['pullback_first_high']
-    detail['breakout_rvol'] = detail['rvol_ratio']
+
+    confirmed, detail = _entry_gate_detail(state, watch, close, open_price, volume)
+    detail["entry_candle_open_time"] = candle_key
     _mark_entry_taken(symbol, stage, candle_key)
-    state['watch'] = None
-    state['rally3_pullback'] = None
-    state['after_entry'] = {
-        'stage': stage,
-        'open_time': open_time,
-        'high': high,
-        'low': low,
-        'volume': volume,
-    } if stage == 'rally2' else None
+    # Crossing happened, so this setup is dead regardless of pass/fail.
+    state["watch"] = None
 
-    tag = 'ðŸŸ¢ SPOT' if state['tradeable'] else 'ðŸŸ¡ ALPHA'
-    msg = (f'{tag} {symbol}\nTRADE ENTRY {stage.upper()} â€” LIVE BREAKOUT\n'
-           f'Breakout Level: {watch["pullback_first_high"]:.8f}\n'
-           f'Trigger Price: {close:.8f}\nTimeframe: 5m\n{_detail_line(detail)} | Breakout RVOL={detail["breakout_rvol"]:.2f}x')
-    log.info(msg.replace(chr(10), ' | '))
+    if not confirmed:
+        # Deliberately silent: user requested no noisy scanning/rejection logs.
+        return
+
+    tag = "ðŸŸ¢ SPOT" if state["tradeable"] else "ðŸŸ¡ ALPHA (manual only)"
+    msg = (f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout (LIVE)\n"
+           f"Breakout Price: {close:.6f}\nTimeframe: 5m\n"
+           f"{_detail_line(detail)} | Breakout RVOL={detail['breakout_rvol_ratio']:.2f}x")
+    log.info(msg.replace(chr(10), " | "))
     _run_bg(send_telegram, msg)
-    if state['tradeable'] and ENABLE_TRADING:
-        _run_bg(open_long, symbol, stage, detail, candle_key)
+    if state["tradeable"] and ENABLE_TRADING:
+        _run_bg(open_long, symbol, stage, detail)
 
+
+# ----------------------------- WEBSOCKET LOOPS -----------------------------
 async def _subscribe_all(ws, stream_names):
     for i in range(0, len(stream_names), STREAMS_PER_SUBSCRIBE):
         batch = stream_names[i:i + STREAMS_PER_SUBSCRIBE]
@@ -1000,7 +1116,7 @@ async def spot_ws_loop(spot_symbols):
                     # that burst. Offload to the candle-close thread pool.
                     _submit_candle_close(symbol, o, h, l, c, v, k["t"], k["T"])
                 else:
-                    on_live_tick(symbol, o, h, float(k["l"]), c, v, k["t"])
+                    on_live_tick(symbol, o, h, c, v, k["t"])
             except Exception as e:
                 log.warning("Spot WS message error: %s", e)
 
@@ -1023,21 +1139,50 @@ async def alpha_ws_loop(alpha_tokens):
                 if k["x"]:
                     _submit_candle_close(name, o, h, l, c, v, k["t"], k["T"])
                 else:
-                    on_live_tick(name, o, h, float(k["l"]), c, v, k["t"])
+                    on_live_tick(name, o, h, c, v, k["t"])
             except Exception as e:
                 log.warning("Alpha WS message error: %s", e)
 
 
 async def periodic_tasks(duration_seconds):
+    """Updates the heartbeat every minute (silently, for the watchdog) but
+    only PRINTS a status line every HEALTH_LOG_EVERY_SECONDS, so routine
+    logs don't drown out the entry/exit lines that actually matter. Nothing
+    here ever goes to Telegram -- Telegram only gets the actual trade
+    signal/open/close messages, never periodic status noise. Returns
+    (letting the caller trigger a full reseed+reconnect) after
+    `duration_seconds`."""
     global _last_heartbeat
     elapsed = 0
+    HEALTH_LOG_EVERY_SECONDS = 30 * 60          # print a routine status line only this often
+    since_health_log = 0
     while elapsed < duration_seconds:
         await asyncio.sleep(60)
         elapsed += 60
-        _last_heartbeat = time.time()
+        since_health_log += 60
+        _last_heartbeat = time.time()  # keeps the watchdog satisfied every cycle, no log line needed for this alone
         _prune_old_entries()
 
-WATCHDOG_TIMEOUT_SECONDS = 300  # restart only if heartbeat is stale for 5 minutes
+        if since_health_log >= HEALTH_LOG_EVERY_SECONDS:
+            since_health_log = 0
+            log_portfolio_summary(also_telegram=False)
+            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            pending = _CANDLE_EXECUTOR._work_queue.qsize()
+            log.info("HEALTH: memory=%.1fMB | symbols_tracked=%d | candle-close queue backlog=%d | dedup_cache=%d",
+                      mem_mb, len(_symbol_state), pending, len(_entries_taken))
+
+
+# ----------------------------- WATCHDOG ------------------------------------
+# Even after fixing every hang cause found so far, there could always be a
+# not-yet-seen one. Rather than keep chasing causes one at a time, this is
+# an unconditional safety net: if the heartbeat above hasn't updated in
+# WATCHDOG_TIMEOUT_SECONDS, something is stuck badly enough that nothing in
+# this process can be trusted to recover on its own -- so it hard-exits the
+# whole process (os._exit, not a normal exception) and lets Railway restart
+# it completely fresh. This runs on a plain OS thread, independent of
+# asyncio, so it keeps working even if the event loop itself is wedged.
+_last_heartbeat = time.time()
+WATCHDOG_TIMEOUT_SECONDS = 300  # 5 min -- heartbeat is expected every 60s
 
 
 def _watchdog_loop():
