@@ -68,8 +68,8 @@ TESTNET_API_SECRET = os.environ.get("TESTNET_API_SECRET", "")
 TESTNET_BASE = "https://testnet.binance.vision"
 
 ACCOUNT_BUDGET_USDT = 500
-TRADE_SIZE_USDT = 100
-MAX_CONCURRENT_TRADES = int(ACCOUNT_BUDGET_USDT / TRADE_SIZE_USDT)  # 5
+TRADE_SIZE_USDT = 50
+MAX_CONCURRENT_TRADES = int(ACCOUNT_BUDGET_USDT / TRADE_SIZE_USDT)  # 10
 FEE_RATE = 0.001  # Binance standard spot trading fee: 0.1% per side (entry + exit)
 
 BINANCE_BASE = "https://api.binance.com"
@@ -164,7 +164,7 @@ def _sync_state_to_telegram():
         return
     open_count = sum(len(v) for v in _open_positions.values())
     text = (
-        "📌 Bot state (auto-updated -- please don't delete or unpin this message)\n"
+        "ðŸ“Œ Bot state (auto-updated -- please don't delete or unpin this message)\n"
         f"Lifetime PnL: {_stats['realized_pnl_total']:.2f} USDT\n"
         f"Trades: {_stats['trades_closed']} (W:{_stats['wins']} L:{_stats['losses']})\n"
         f"Open positions right now: {open_count}\n"
@@ -399,13 +399,11 @@ def _rvol_ok_against(volume, vol_ma_lookup) -> bool:
     return False
 
 
-def _breakout_confirmed(high, volume, pullback_first_high, prev_volume, vol_ma_lookup=None,
-                         trend_ok=True, macd_ok=True) -> bool:
+def _breakout_confirmed(high, volume, pullback_first_high, prev_volume, vol_ma_lookup=None) -> bool:
     """Fires the instant price crosses the pullback's first red candle's
     high (wick included), with volume showing at least some increase vs.
-    the immediately preceding candle, RVOL >= floor at the breakout itself,
-    AND the trend stack (EMA9>EMA20>VWAP>EMA200) plus MACD-above-signal
-    holding AGAIN at this exact moment (not just when rally1 formed).
+    the immediately preceding candle, AND RVOL >= 1x (same floor as rally1
+    formation, no ceiling -- higher is always fine) at the breakout itself.
     Takes plain values (not a pandas row) so it can be called cheaply on
     every live WebSocket tick."""
     if high <= pullback_first_high:
@@ -413,8 +411,6 @@ def _breakout_confirmed(high, volume, pullback_first_high, prev_volume, vol_ma_l
     if prev_volume is not None and volume < prev_volume:
         return False
     if not _rvol_ok_against(volume, vol_ma_lookup):
-        return False
-    if not trend_ok or not macd_ok:
         return False
     return True
 
@@ -535,7 +531,7 @@ def run_state_machine(df: pd.DataFrame):
                         # against this same already-broken level (that would
                         # mean entering well after the real breakout, at a
                         # worse price than the actual crossing).
-                        if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, pullback_candles[-1]["volume"], _row_vol_ma_lookup(row), _trend_ok(row), _macd_ok(row)):
+                        if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, pullback_candles[-1]["volume"], _row_vol_ma_lookup(row)):
                             entry_index = i
                             entry_stage = stage_after_pullback
                             entry_price = row["close"]
@@ -566,7 +562,7 @@ def run_state_machine(df: pd.DataFrame):
                     # First candle to cross the level -- one-shot judgment,
                     # same rule as above: pass now or the setup is dead.
                     prev_vol = watch_candles[-2]["volume"] if len(watch_candles) >= 2 else pullback_candles[-1]["volume"]
-                    if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, prev_vol, _row_vol_ma_lookup(row), _trend_ok(row), _macd_ok(row)):
+                    if _breakout_confirmed(row["high"], row["volume"], pullback_first_high, prev_vol, _row_vol_ma_lookup(row)):
                         entry_index = i
                         entry_stage = stage_after_pullback
                         entry_price = row["close"]
@@ -646,7 +642,7 @@ def total_open_trades() -> int:
     return sum(len(v) for v in _open_positions.values())
 
 
-def open_long(symbol: str, stage: str, detail: dict = None, entry_candle_open_time=None):
+def open_long(symbol: str, stage: str, detail: dict = None):
     if total_open_trades() >= MAX_CONCURRENT_TRADES:
         log.info("Budget full (%d/%d trades) -- skipping %s entry on %s",
                   total_open_trades(), MAX_CONCURRENT_TRADES, stage, symbol)
@@ -667,7 +663,6 @@ def open_long(symbol: str, stage: str, detail: dict = None, entry_candle_open_ti
     _open_positions.setdefault(symbol, []).append({
         "qty": qty, "entry_price": entry_price, "entry_fee": entry_fee,
         "entry_time": time.time(), "stage": stage,
-        "entry_candle_open_time": entry_candle_open_time,
         "entry_rvol_ratio": detail.get("rvol_ratio") if detail else None,
         "entry_rvol_period": detail.get("rvol_period") if detail else None,
         "entry_retrace_pct": detail.get("pullback_retrace_pct") if detail else None,
@@ -727,7 +722,7 @@ def _compute_breakdown() -> str:
     tightened toward whatever's working best."""
     records = _trade_history
     if not records:
-        return "📊 PERFORMANCE BREAKDOWN: no trade history yet."
+        return "ðŸ“Š PERFORMANCE BREAKDOWN: no trade history yet."
 
     rvol_section = _summarize_bucket(records, lambda r: _bucket_rvol(r.get("rvol_ratio")), "RVOL magnitude")
     period_section = _summarize_bucket(
@@ -741,7 +736,7 @@ def _compute_breakdown() -> str:
     total_pnl = sum(r["pnl"] for r in records)
 
     return (
-        f"📊 PERFORMANCE BREAKDOWN (last {total} trades)\n\n"
+        f"ðŸ“Š PERFORMANCE BREAKDOWN (last {total} trades)\n\n"
         f"{rvol_section}\n\n{period_section}\n\n{retrace_section}\n\n"
         f"Overall: {total} trades, {win_rate:.1f}% win rate, total pnl {total_pnl:+.2f} USDT"
     )
@@ -788,7 +783,7 @@ def close_all_for_symbol(symbol: str):
         hold_minutes = (time.time() - pos["entry_time"]) / 60
         win_rate = (_stats["wins"] / _stats["trades_closed"] * 100) if _stats["trades_closed"] else 0
         close_msg = (
-            f"{'🟢' if pnl >= 0 else '🔴'} TRADE CLOSE {symbol} [{pos['stage']}]\n"
+            f"{'ðŸŸ¢' if pnl >= 0 else 'ðŸ”´'} TRADE CLOSE {symbol} [{pos['stage']}]\n"
             f"Entry: {pos['entry_price']:.6f} | Exit: {exit_price:.6f}\n"
             f"This trade: gross={gross_pnl:.2f} fees={total_fees:.2f} net={pnl:.2f} USDT ({hold_minutes:.1f} min held)\n"
             f"Lifetime: total PnL={_stats['realized_pnl_total']:.2f} USDT | "
@@ -820,7 +815,7 @@ def log_portfolio_summary(also_telegram: bool = False):
                "\n  ".join(lines) + f"\n{trailer}")
     log.info(msg.replace(chr(10), "\n"))
     if also_telegram:
-        send_telegram(f"📊 Status update\n{msg}")
+        send_telegram(f"ðŸ“Š Status update\n{msg}")
 
 
 # ----------------------------- PER-SYMBOL STATE ----------------------------
@@ -867,7 +862,7 @@ def _signal_and_maybe_trade(symbol: str, tradeable: bool, entry_result):
     if _entry_already_taken(symbol, stage, candle_key):
         return
     _mark_entry_taken(symbol, stage, candle_key)
-    tag = "🟢 SPOT" if tradeable else "🟡 ALPHA (manual only)"
+    tag = "ðŸŸ¢ SPOT" if tradeable else "ðŸŸ¡ ALPHA (manual only)"
     msg = (f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout\nPrice: {price:.6f}\nTimeframe: 5m\n"
            f"{_detail_line(detail)}")
     log.info(msg.replace(chr(10), " | "))
@@ -938,39 +933,6 @@ def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
             _run_bg(close_all_for_symbol, symbol)
 
 
-def _live_indicator_row(state, o, high, low, close, volume):
-    """Recomputes EMA9/20/200, VWAP, and MACD as if the live (still-forming)
-    candle were appended to the closed-candle history -- so trend_ok/macd_ok
-    can be checked fresh AT the breakout moment, not from stale
-    already-closed values. Only called when price has just crossed the
-    breakout level (not on every tick), so the extra computation is cheap
-    in aggregate."""
-    df = state["df"]
-    if df is None or len(df) < 210:
-        return None
-    closes = pd.concat([df["close"], pd.Series([float(close)])], ignore_index=True)
-    ema9 = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
-    ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
-    ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
-    typical_hist = (df["high"] + df["low"] + df["close"]) / 3
-    base_vol = float(df["volume"].sum())
-    base_vp = float((typical_hist * df["volume"]).sum())
-    live_typical = (float(high) + float(low) + float(close)) / 3.0
-    total_vol = base_vol + float(volume)
-    vwap = (base_vp + live_typical * float(volume)) / total_vol if total_vol > 0 else float(df.iloc[-1]["vwap"])
-    ema12 = closes.ewm(span=12, adjust=False).mean()
-    ema26 = closes.ewm(span=26, adjust=False).mean()
-    macd_series = ema12 - ema26
-    macd = float(macd_series.iloc[-1])
-    macd_signal = float(macd_series.ewm(span=9, adjust=False).mean().iloc[-1])
-    return {
-        "ema9": ema9, "ema20": ema20, "ema200": ema200, "vwap": vwap,
-        "macd": macd, "macd_signal": macd_signal,
-        "trend_ok": ema9 > ema20 > vwap > ema200,
-        "macd_ok": macd > macd_signal,
-    }
-
-
 def _live_rvol_detail(volume, vol_ma_lookup, last_closed_row) -> dict:
     """Same shape as _entry_detail, but computes RVOL from the ACTUAL live
     tick's volume against the watch state's vol_ma reference -- not the
@@ -998,63 +960,34 @@ def _live_rvol_detail(volume, vol_ma_lookup, last_closed_row) -> dict:
     }
 
 
-def _check_live_exit(symbol: str, o: float, close: float, open_time):
-    """Exit rule, live version: the moment ANY candle AFTER the entry candle
-    starts trading red (close < open right now, even mid-formation), get
-    out immediately -- don't wait for that candle to fully close."""
-    positions = _open_positions.get(symbol)
-    if not positions:
-        return
-    for pos in positions:
-        entry_candle = pos.get("entry_candle_open_time")
-        if entry_candle is not None and open_time > entry_candle and close < o:
-            _run_bg(close_all_for_symbol, symbol)
-            return  # close_all_for_symbol closes ALL positions for this symbol at once
-
-
-def on_live_tick(symbol: str, o: float, high: float, low: float, close: float, volume: float, open_time):
+def on_live_tick(symbol: str, high: float, close: float, volume: float, open_time):
     state = _symbol_state.get(symbol)
     if state is None:
         return
-
-    if state["tradeable"] and symbol in _open_positions:
-        _check_live_exit(symbol, o, close, open_time)
-
     watch = state.get("watch")
-    if not watch or high <= watch["pullback_first_high"]:
+    if not watch:
         return
-
-    live = _live_indicator_row(state, o, high, low, close, volume)
-    if live is None:
-        return
-
-    if _breakout_confirmed(high, volume, watch["pullback_first_high"], watch["prev_volume"],
-                            watch.get("vol_ma_lookup"), live["trend_ok"], live["macd_ok"]):
+    if _breakout_confirmed(high, volume, watch["pullback_first_high"], watch["prev_volume"], watch.get("vol_ma_lookup")):
         candle_key = open_time
         stage = watch["stage"]
         if _entry_already_taken(symbol, stage, candle_key):
             return
-        # Reflects the EXACT live volume/RVOL/trend/MACD that was just
-        # gated above -- not stale closed-candle numbers.
-        detail = _live_rvol_detail(volume, watch.get("vol_ma_lookup"), state["df"].iloc[-1])
-        detail["macd"] = live["macd"]
-        detail["macd_signal"] = live["macd_signal"]
-        detail["macd_above_signal"] = live["macd_ok"]
-        detail["ema9"] = live["ema9"]
-        detail["ema20"] = live["ema20"]
-        detail["vwap"] = live["vwap"]
-        detail["ema200"] = live["ema200"]
+        # Reflects the EXACT live volume/RVOL that was just gated above --
+        # not a stale closed-candle number.
+        last_closed = state["df"].iloc[-1]
+        detail = _live_rvol_detail(volume, watch.get("vol_ma_lookup"), last_closed)
         detail["pullback_retrace_pct"] = watch.get("pullback_retrace_pct", 0.0)
         _mark_entry_taken(symbol, stage, candle_key)
-        tag = "🟢 SPOT" if state["tradeable"] else "🟡 ALPHA (manual only)"
+        tag = "ðŸŸ¢ SPOT" if state["tradeable"] else "ðŸŸ¡ ALPHA (manual only)"
         msg = (f"{tag} {symbol}\nEntry signal: {stage.upper()} breakout (live)\nPrice: {close:.6f}\nTimeframe: 5m\n"
                f"{_detail_line(detail)}")
         log.info(msg.replace(chr(10), " | "))
         _run_bg(send_telegram, msg)
         if state["tradeable"] and ENABLE_TRADING:
-            _run_bg(open_long, symbol, stage, detail, candle_key)
+            _run_bg(open_long, symbol, stage, detail)
         # Clear the watch so we don't refire every tick until the candle
         # closes and the state machine naturally rebuilds (possibly into
+
         # rally3 pullback-tracking).
         state["watch"] = None
 
@@ -1169,7 +1102,7 @@ def _watchdog_loop():
                 WATCHDOG_TIMEOUT_SECONDS
             )
             try:
-                send_telegram("⚠️ Bot got stuck and is force-restarting itself now (watchdog triggered). Back online shortly.")
+                send_telegram("âš ï¸ Bot got stuck and is force-restarting itself now (watchdog triggered). Back online shortly.")
             except Exception:
                 pass
             os._exit(1)
@@ -1192,7 +1125,7 @@ async def run_bot_cycle():
         bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID), ENABLE_TRADING,
         ACCOUNT_BUDGET_USDT, TRADE_SIZE_USDT, MAX_CONCURRENT_TRADES
     )
-    send_telegram("✅ Wave strategy bot is online (real-time WebSocket, Spot + Alpha).")
+    send_telegram("âœ… Wave strategy bot is online (real-time WebSocket, Spot + Alpha).")
 
     await asyncio.gather(
         spot_ws_loop(spot_symbols),
