@@ -399,11 +399,13 @@ def _rvol_ok_against(volume, vol_ma_lookup) -> bool:
     return False
 
 
-def _breakout_confirmed(high, volume, pullback_first_high, prev_volume, vol_ma_lookup=None) -> bool:
+def _breakout_confirmed(high, volume, pullback_first_high, prev_volume, vol_ma_lookup=None,
+                         trend_ok=True, macd_ok=True) -> bool:
     """Fires the instant price crosses the pullback's first red candle's
     high (wick included), with volume showing at least some increase vs.
-    the immediately preceding candle, AND RVOL >= 1x (same floor as rally1
-    formation, no ceiling -- higher is always fine) at the breakout itself.
+    the immediately preceding candle, RVOL >= floor at the breakout itself,
+    AND the trend stack (EMA9>EMA20>VWAP>EMA200) plus MACD-above-signal
+    holding AGAIN at this exact moment (not just when rally1 formed).
     Takes plain values (not a pandas row) so it can be called cheaply on
     every live WebSocket tick."""
     if high <= pullback_first_high:
@@ -411,6 +413,8 @@ def _breakout_confirmed(high, volume, pullback_first_high, prev_volume, vol_ma_l
     if prev_volume is not None and volume < prev_volume:
         return False
     if not _rvol_ok_against(volume, vol_ma_lookup):
+        return False
+    if not trend_ok or not macd_ok:
         return False
     return True
 
@@ -933,6 +937,39 @@ def on_candle_close(symbol: str, o, h, l, c, v, open_time, close_time):
             _run_bg(close_all_for_symbol, symbol)
 
 
+def _live_indicator_row(state, o, high, low, close, volume):
+    """Recomputes EMA9/20/200, VWAP, and MACD as if the live (still-forming)
+    candle were appended to the closed-candle history -- so trend_ok/macd_ok
+    can be checked fresh AT the breakout moment, not from stale
+    already-closed values. Only called when price has just crossed the
+    breakout level (not on every tick), so the extra computation is cheap
+    in aggregate."""
+    df = state["df"]
+    if df is None or len(df) < 210:
+        return None
+    closes = pd.concat([df["close"], pd.Series([float(close)])], ignore_index=True)
+    ema9 = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
+    ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+    ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
+    typical_hist = (df["high"] + df["low"] + df["close"]) / 3
+    base_vol = float(df["volume"].sum())
+    base_vp = float((typical_hist * df["volume"]).sum())
+    live_typical = (float(high) + float(low) + float(close)) / 3.0
+    total_vol = base_vol + float(volume)
+    vwap = (base_vp + live_typical * float(volume)) / total_vol if total_vol > 0 else float(df.iloc[-1]["vwap"])
+    ema12 = closes.ewm(span=12, adjust=False).mean()
+    ema26 = closes.ewm(span=26, adjust=False).mean()
+    macd_series = ema12 - ema26
+    macd = float(macd_series.iloc[-1])
+    macd_signal = float(macd_series.ewm(span=9, adjust=False).mean().iloc[-1])
+    return {
+        "ema9": ema9, "ema20": ema20, "ema200": ema200, "vwap": vwap,
+        "macd": macd, "macd_signal": macd_signal,
+        "trend_ok": ema9 > ema20 > vwap > ema200,
+        "macd_ok": macd > macd_signal,
+    }
+
+
 def _live_rvol_detail(volume, vol_ma_lookup, last_closed_row) -> dict:
     """Same shape as _entry_detail, but computes RVOL from the ACTUAL live
     tick's volume against the watch state's vol_ma reference -- not the
@@ -960,22 +997,52 @@ def _live_rvol_detail(volume, vol_ma_lookup, last_closed_row) -> dict:
     }
 
 
-def on_live_tick(symbol: str, high: float, close: float, volume: float, open_time):
+def _check_live_exit(symbol: str, o: float, close: float, open_time):
+    """Exit rule, live version: the moment ANY candle AFTER the entry candle
+    starts trading red (close < open right now, even mid-formation), get
+    out immediately -- don't wait for that candle to fully close."""
+    positions = _open_positions.get(symbol)
+    if not positions:
+        return
+    for pos in positions:
+        entry_candle = pos.get("entry_candle_open_time")
+        if entry_candle is not None and open_time > entry_candle and close < o:
+            _run_bg(close_all_for_symbol, symbol)
+            return  # close_all_for_symbol closes ALL positions for this symbol at once
+
+
+def on_live_tick(symbol: str, o: float, high: float, low: float, close: float, volume: float, open_time):
     state = _symbol_state.get(symbol)
     if state is None:
         return
+
+    if state["tradeable"] and symbol in _open_positions:
+        _check_live_exit(symbol, o, close, open_time)
+
     watch = state.get("watch")
-    if not watch:
+    if not watch or high <= watch["pullback_first_high"]:
         return
-    if _breakout_confirmed(high, volume, watch["pullback_first_high"], watch["prev_volume"], watch.get("vol_ma_lookup")):
+
+    live = _live_indicator_row(state, o, high, low, close, volume)
+    if live is None:
+        return
+
+    if _breakout_confirmed(high, volume, watch["pullback_first_high"], watch["prev_volume"],
+                            watch.get("vol_ma_lookup"), live["trend_ok"], live["macd_ok"]):
         candle_key = open_time
         stage = watch["stage"]
         if _entry_already_taken(symbol, stage, candle_key):
             return
-        # Reflects the EXACT live volume/RVOL that was just gated above --
-        # not a stale closed-candle number.
-        last_closed = state["df"].iloc[-1]
-        detail = _live_rvol_detail(volume, watch.get("vol_ma_lookup"), last_closed)
+        # Reflects the EXACT live volume/RVOL/trend/MACD that was just
+        # gated above -- not stale closed-candle numbers.
+        detail = _live_rvol_detail(volume, watch.get("vol_ma_lookup"), state["df"].iloc[-1])
+        detail["macd"] = live["macd"]
+        detail["macd_signal"] = live["macd_signal"]
+        detail["macd_above_signal"] = live["macd_ok"]
+        detail["ema9"] = live["ema9"]
+        detail["ema20"] = live["ema20"]
+        detail["vwap"] = live["vwap"]
+        detail["ema200"] = live["ema200"]
         detail["pullback_retrace_pct"] = watch.get("pullback_retrace_pct", 0.0)
         _mark_entry_taken(symbol, stage, candle_key)
         tag = "🟢 SPOT" if state["tradeable"] else "🟡 ALPHA (manual only)"
@@ -984,10 +1051,9 @@ def on_live_tick(symbol: str, high: float, close: float, volume: float, open_tim
         log.info(msg.replace(chr(10), " | "))
         _run_bg(send_telegram, msg)
         if state["tradeable"] and ENABLE_TRADING:
-            _run_bg(open_long, symbol, stage, detail)
+            _run_bg(open_long, symbol, stage, detail, candle_key)
         # Clear the watch so we don't refire every tick until the candle
         # closes and the state machine naturally rebuilds (possibly into
-
         # rally3 pullback-tracking).
         state["watch"] = None
 
