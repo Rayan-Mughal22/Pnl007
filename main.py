@@ -13,7 +13,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 
-SCAN_INTERVAL = 15  # 15 seconds fast scanning
+SCAN_INTERVAL = 15  # Fast 15-second scanning
 TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
@@ -61,7 +61,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 3. UPDATED STRATEGY LOGIC
+# 3. STRATEGY LOGIC
 # ==========================================
 def check_strategy(df, symbol, category_name):
     if len(df) < 210:
@@ -107,7 +107,7 @@ def check_strategy(df, symbol, category_name):
         idx -= 1
 
     if len(pullback_candles) == 0:
-        return False, ""  # Pullback red candles required
+        return False, ""  # Red pullback required
 
     # Green Rally Candles (Directly before pullback)
     rally_candles = []
@@ -115,11 +115,11 @@ def check_strategy(df, symbol, category_name):
         rally_candles.append(candles.loc[idx])
         idx -= 1
 
-    # Rule: Minimum 2 Green Candles in Rally (No Body % Limit)
+    # Rule: Minimum 2 Green Candles in Rally (No Body % Filter)
     if len(rally_candles) < 2:
         return False, ""
 
-    # Rule: Retracement MUST be 20% or LESS (Strict Limit)
+    # Rule: Retracement MUST be 20% or LESS
     rally_low = min(c['low'] for c in rally_candles)
     rally_high = max(c['high'] for c in rally_candles)
     rally_move = rally_high - rally_low
@@ -131,7 +131,7 @@ def check_strategy(df, symbol, category_name):
     pullback_depth = rally_high - pullback_low
     retracement_pct = (pullback_depth / rally_move) * 100
 
-    if retracement_pct > 20.0:  # Max 20% Retracement
+    if retracement_pct > 20.0:  # Max 20% Retracement limit
         return False, ""
 
     # Rule: Pullback Volume MUST be at least 40% lower than Rally Volume
