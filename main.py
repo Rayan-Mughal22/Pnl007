@@ -1,254 +1,413 @@
+"""
+Binance Spot USDT Rally-Pullback Scanner  ->  Telegram instant alerts
+
+Strategy (5m chart), ALL must be true:
+  1. RVOL (volume / average of previous 50 candles) >= 5x on the rally
+  2. EMA9 > EMA20 > VWAP > EMA200   (EMA9 & EMA20 above VWAP, all three above EMA200)
+  3. MACD line > MACD signal line
+  4. Rally = 2 or more consecutive green candles
+  5. Pullback = 1+ consecutive red candles right after the rally
+  6. Pullback retracement < 30% of the rally range
+  7. Rally volume bars clearly bigger than pullback red volume bars
+  -> The moment the next candle turns green (live tick, no waiting for 5m close) => Telegram alert
+
+Environment variables (Railway -> Variables):
+  TELEGRAM_BOT_TOKEN   (required)
+  TELEGRAM_CHAT_ID     (required)
+Optional tuning:
+  RVOL_MIN (5), RVOL_PERIOD (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.30), VOL_DOMINANCE (1.5)
+"""
+
+import asyncio
+import json
+import logging
 import os
+import threading
 import time
-import requests
-import numpy as np
-import pandas as pd
-from binance.client import Client
 
-# ==========================================
-# 1. CONFIGURATION & ENVIRONMENT VARIABLES
-# ==========================================
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "YOUR_BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+import aiohttp
+import websockets
 
-SCAN_INTERVAL = 15  # Fast 15-second scanning
-TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
+# ----------------------------- CONFIG ---------------------------------------
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+TF_MS = 5 * 60 * 1000
+DAY_MS = 24 * 60 * 60 * 1000
+HIST = 500                                   # closed candles kept per symbol
 
-def send_telegram_msg(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARNING] Telegram tokens missing.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code != 200:
-            print(f"[ERROR] Telegram Failed: {res.text}")
-    except Exception as e:
-        print(f"[ERROR] Telegram Connection Exception: {e}")
+RVOL_PERIOD = int(os.getenv("RVOL_PERIOD", "50"))
+RVOL_MIN = float(os.getenv("RVOL_MIN", "5"))
+MIN_RALLY_CANDLES = int(os.getenv("MIN_RALLY_CANDLES", "2"))
+MAX_RETRACE = float(os.getenv("MAX_RETRACE", "0.30"))
+# rally avg volume must be at least this many times the pullback avg volume
+# (and every pullback red candle must also be below the rally avg volume)
+VOL_DOMINANCE = float(os.getenv("VOL_DOMINANCE", "1.5"))
 
-# ==========================================
-# 2. INDICATORS CALCULATION
-# ==========================================
-def calculate_indicators(df):
-    # Exponential Moving Averages (EMA 9, 20, 200)
-    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+REST_HOSTS = ["api.binance.com", "data-api.binance.vision"]
+WS_HOSTS = ["stream.binance.com:9443", "data-stream.binance.vision"]
+STREAMS_PER_CONN = 150
+WATCHDOG_SECONDS = 180                       # no WS data for this long -> exit (Railway restarts)
 
-    # VWAP (Volume Weighted Average Price)
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    df['vwap'] = (tp * df['volume']).cumsum() / df['volume'].cumsum()
+EXCLUDE_BASES = {
+    "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDD", "AEUR", "EUR", "EURI",
+    "GBP", "TRY", "BRL", "UST", "USTC", "XUSD", "USD1", "PAXG", "WBTC", "WBETH",
+}
+BAD_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
-    # RVOL (Relative Volume vs 50-period SMA Volume)
-    df['vol_ma50'] = df['volume'].rolling(window=50).mean()
-    df['rvol'] = df['volume'] / df['vol_ma50']
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("scanner")
 
-    # MACD (12, 26, 9)
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = ema12 - ema26
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+_last_beat = time.time()
+_alerts_sent = 0
 
-    return df
 
-# ==========================================
-# 3. STRATEGY LOGIC
-# ==========================================
-def check_strategy(df, symbol, category_name):
-    if len(df) < 210:
-        return False, ""
+class Sym:
+    __slots__ = ("candles", "setup", "alerted_t", "reseeding")
 
-    curr = df.iloc[-1]       # Current active (live forming) candle
-    prev = df.iloc[-2]       # Last completed 5m candle
+    def __init__(self):
+        self.candles = []        # closed candles: (t, o, h, l, c, v)
+        self.setup = None        # valid rally+pullback setup computed on last closed candle
+        self.alerted_t = 0       # open time of the candle we already alerted on
+        self.reseeding = False
 
-    # 1. Instant Trigger: Current candle MUST start/be GREEN (Price > Open)
-    if curr['close'] <= curr['open']:
-        return False, ""
 
-    # 2. RVOL Check: Minimum 2x
-    rvol_val = max(prev['rvol'], curr['rvol'])
-    if rvol_val < 2.0 or np.isnan(rvol_val):
-        return False, ""
+STATE = {}
 
-    # 3. Moving Averages & VWAP Stack Condition
-    # EMA 9 > EMA 20 > VWAP > EMA 200
-    cond_ma = (
-        (prev['ema9'] > prev['ema20']) and
-        (prev['ema9'] > prev['vwap']) and
-        (prev['ema20'] > prev['vwap']) and
-        (prev['ema9'] > prev['ema200']) and
-        (prev['ema20'] > prev['ema200']) and
-        (prev['vwap'] > prev['ema200'])
-    )
-    if not cond_ma:
-        return False, ""
 
-    # 4. MACD Line > Signal Line
-    if prev['macd'] <= prev['macd_signal']:
-        return False, ""
+# ----------------------------- INDICATORS -----------------------------------
+def ema_series(vals, period):
+    a = 2.0 / (period + 1)
+    out = []
+    e = vals[0]
+    for i, v in enumerate(vals):
+        e = v if i == 0 else e + a * (v - e)
+        out.append(e)
+    return out
 
-    # 5. Extract Pullback (Red) & Rally (Green) Candles
-    candles = df.iloc[:-1].reset_index(drop=True)
 
-    # Red Pullback Candles
-    pullback_candles = []
-    idx = len(candles) - 1
-    while idx >= 0 and candles.loc[idx, 'close'] < candles.loc[idx, 'open']:
-        pullback_candles.append(candles.loc[idx])
-        idx -= 1
+def trend_check(closed, live):
+    """Trend filters evaluated with the live (forming) candle as the last point."""
+    seq = closed[-HIST:] + [live]
+    if len(seq) < 210:
+        return None
+    closes = [x[4] for x in seq]
+    e9 = ema_series(closes, 9)[-1]
+    e20 = ema_series(closes, 20)[-1]
+    e200 = ema_series(closes, 200)[-1]
+    e12 = ema_series(closes, 12)
+    e26 = ema_series(closes, 26)
+    macd = [a - b for a, b in zip(e12, e26)]
+    sig = ema_series(macd, 9)[-1]
+    m = macd[-1]
 
-    if len(pullback_candles) == 0:
-        return False, ""  # Red pullback required
-
-    # Green Rally Candles (Directly before pullback)
-    rally_candles = []
-    while idx >= 0 and candles.loc[idx, 'close'] > candles.loc[idx, 'open']:
-        rally_candles.append(candles.loc[idx])
-        idx -= 1
-
-    # Rule: Minimum 2 Green Candles in Rally (No Body % Filter)
-    if len(rally_candles) < 2:
-        return False, ""
-
-    # Rule: Retracement MUST be 20% or LESS
-    rally_low = min(c['low'] for c in rally_candles)
-    rally_high = max(c['high'] for c in rally_candles)
-    rally_move = rally_high - rally_low
-
-    if rally_move <= 0:
-        return False, ""
-
-    pullback_low = min(c['low'] for c in pullback_candles)
-    pullback_depth = rally_high - pullback_low
-    retracement_pct = (pullback_depth / rally_move) * 100
-
-    if retracement_pct > 20.0:  # Max 20% Retracement limit
-        return False, ""
-
-    # Rule: Pullback Volume MUST be at least 40% lower than Rally Volume
-    # (i.e. Pullback Volume <= 60% of Rally Volume)
-    avg_rally_vol = np.mean([c['volume'] for c in rally_candles])
-    avg_pullback_vol = np.mean([c['volume'] for c in pullback_candles])
-
-    if avg_rally_vol == 0:
-        return False, ""
-
-    vol_ratio = avg_pullback_vol / avg_rally_vol
-    if vol_ratio > 0.60:  # Must be 40%+ smaller
-        return False, ""
-
-    # -------------------------------------------------------------
-    # 100% STRATEGY MATCH -> INSTANT TELEGRAM SIGNAL
-    # -------------------------------------------------------------
-    msg = (
-        f"🚨 *INSTANT BUY SIGNAL ({category_name})*\n"
-        f"-----------------------------------\n"
-        f"• *Coin:* `{symbol}`\n"
-        f"• *Price:* `{curr['close']}` (Live Green Start)\n"
-        f"• *Timeframe:* `5m`\n"
-        f"• *RVOL:* `{rvol_val:.2f}x` (>= 2x)\n"
-        f"• *Rally:* `{len(rally_candles)} Green Candles`\n"
-        f"• *Retracement:* `{retracement_pct:.1f}%` (<= 20% Max)\n"
-        f"• *Pullback Vol Drop:* `{(1 - vol_ratio)*100:.1f}%` (>= 40% Lower)\n"
-        f"• *Trend Status:* EMA9 > EMA20 > VWAP > EMA200 (MACD Bullish)"
-    )
-
-    return True, msg
-
-# ==========================================
-# 4. PAIRS FETCHING (SPOT + ALPHA)
-# ==========================================
-def get_spot_pairs():
-    try:
-        info = client.get_exchange_info()
-        return [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
-    except Exception as e:
-        print(f"[ERROR] Fetching Spot Pairs: {e}")
-        return []
-
-def get_alpha_pairs(spot_pairs):
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "category": "binance-alpha-spotlight",
-            "per_page": 250,
-            "page": 1
-        }
-        res = requests.get(url, params=params, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            alpha_list = [item.get("symbol", "").upper() + "USDT" for item in data]
-            return [s for s in alpha_list if s in spot_pairs]
-    except Exception as e:
-        print(f"[ERROR] Fetching Alpha Pairs: {e}")
-    
-    fallback = ["KMNOUSDT", "ONDOUSDT", "VIRTUALUSDT", "HUMAUSDT", "SAGAUSDT", "BOMEUSDT"]
-    return [s for s in fallback if s in spot_pairs]
-
-def process_klines(klines_raw):
-    df = pd.DataFrame(klines_raw, columns=[
-        'time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'qav', 'num_trades', 'tb_base_vol', 'tb_quote_vol', 'ignore'
-    ])
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df[col] = df[col].astype(float)
-    return calculate_indicators(df)
-
-def scan_markets(spot_symbols, alpha_symbols):
-    # 1. Scan Alpha Category
-    print("Scanning Binance Alpha Category Coins...")
-    for symbol in alpha_symbols:
-        try:
-            klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=220)
-            df = process_klines(klines)
-            signal, msg = check_strategy(df, symbol, "BINANCE ALPHA")
-            if signal:
-                send_telegram_msg(msg)
-                print(f"[ALPHA SIGNAL SENT]: {symbol}")
-        except Exception:
-            continue
-
-    # 2. Scan Spot Category
-    print("Scanning Binance Spot Pairs...")
-    for symbol in spot_symbols:
-        try:
-            klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=220)
-            df = process_klines(klines)
-            signal, msg = check_strategy(df, symbol, "BINANCE SPOT")
-            if signal:
-                send_telegram_msg(msg)
-                print(f"[SPOT SIGNAL SENT]: {symbol}")
-        except Exception:
-            continue
-
-# ==========================================
-# 5. MAIN EXECUTION LOOP
-# ==========================================
-if __name__ == "__main__":
-    send_telegram_msg("🤖 *Strategy Bot Started!* Monitoring Spot & Alpha Category Pairs...")
-    
-    spot_pairs = get_spot_pairs()
-    alpha_pairs = get_alpha_pairs(spot_pairs)
-
-    print(f"Loaded {len(spot_pairs)} Spot Pairs and {len(alpha_pairs)} Alpha Category Pairs.")
-
-    while True:
-        try:
-            scan_markets(spot_pairs, alpha_pairs)
-            time.sleep(SCAN_INTERVAL)
-        except KeyboardInterrupt:
-            print("Bot stopped by user.")
+    # VWAP resets at 00:00 UTC
+    day = live[0] // DAY_MS
+    pv = vol = 0.0
+    for x in reversed(seq):
+        if x[0] // DAY_MS != day:
             break
+        tp = (x[2] + x[3] + x[4]) / 3.0
+        pv += tp * x[5]
+        vol += x[5]
+    if vol <= 0:
+        return None
+    vwap = pv / vol
+
+    ok = (e9 > e20 > vwap > e200) and (m > sig)
+    return {"ok": ok, "e9": e9, "e20": e20, "vwap": vwap, "e200": e200, "macd": m, "sig": sig}
+
+
+def eval_setup(cs):
+    """Rally (2+ green) -> pullback (red candles) check on CLOSED candles only."""
+    n = len(cs)
+    if n < RVOL_PERIOD + MIN_RALLY_CANDLES + 2:
+        return None
+
+    # pullback = trailing run of red candles
+    i = n - 1
+    while i >= 0 and cs[i][4] < cs[i][1]:
+        i -= 1
+    pb_start = i + 1
+    if pb_start == n:                       # last closed candle is not red
+        return None
+
+    # rally = run of green candles right before the pullback
+    j = i
+    while j >= 0 and cs[j][4] > cs[j][1]:
+        j -= 1
+    rally_start = j + 1
+    rally = cs[rally_start:pb_start]
+    pb = cs[pb_start:]
+    if len(rally) < MIN_RALLY_CANDLES or rally_start < RVOL_PERIOD:
+        return None
+
+    # retracement must be < 30% of rally range
+    r_high = max(x[2] for x in rally)
+    r_low = min(x[3] for x in rally)
+    rng = r_high - r_low
+    if rng <= 0:
+        return None
+    pb_low = min(x[3] for x in pb)
+    retrace = (r_high - pb_low) / rng
+    if retrace >= MAX_RETRACE:
+        return None
+
+    # rally volume clearly bigger than pullback volume
+    avg_r = sum(x[5] for x in rally) / len(rally)
+    avg_p = sum(x[5] for x in pb) / len(pb)
+    if avg_p <= 0 or avg_r < VOL_DOMINANCE * avg_p:
+        return None
+    if max(x[5] for x in pb) >= avg_r:
+        return None
+
+    # RVOL: best rally candle vs the 50 candles before it
+    best_rvol = 0.0
+    for k in range(rally_start, pb_start):
+        base = cs[k - RVOL_PERIOD:k]
+        ma = sum(x[5] for x in base) / RVOL_PERIOD
+        if ma > 0:
+            best_rvol = max(best_rvol, cs[k][5] / ma)
+    if best_rvol < RVOL_MIN:
+        return None
+
+    return {
+        "last_t": cs[-1][0],
+        "rally_n": len(rally),
+        "pb_n": len(pb),
+        "retrace": retrace * 100,
+        "rvol": best_rvol,
+        "vol_ratio": avg_r / avg_p,
+    }
+
+
+# ----------------------------- TELEGRAM -------------------------------------
+async def tg_send(session, text):
+    if not TOKEN or not CHAT_ID:
+        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing")
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+    for attempt in range(3):
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    return
+                log.warning("Telegram HTTP %s: %s", r.status, (await r.text())[:200])
         except Exception as e:
-            print(f"[LOOP ERROR]: {e}")
-            time.sleep(10)
+            log.warning("Telegram error: %r", e)
+        await asyncio.sleep(2 * (attempt + 1))
+
+
+def fmt(x):
+    return f"{x:.8g}"
+
+
+def build_alert(sym, live, setup, ind):
+    base = sym[:-4]
+    return (
+        f"ðŸš€ RALLY-PULLBACK ALERT (5m)\n"
+        f"{sym}\n"
+        f"Price: {fmt(live[4])}  (green candle open: {fmt(live[1])})\n\n"
+        f"Rally: {setup['rally_n']} green | Pullback: {setup['pb_n']} red\n"
+        f"Retracement: {setup['retrace']:.1f}% (max {MAX_RETRACE * 100:.0f}%)\n"
+        f"RVOL (peak rally, {RVOL_PERIOD}p): {setup['rvol']:.1f}x (min {RVOL_MIN:g}x)\n"
+        f"Rally vol / pullback vol: {setup['vol_ratio']:.1f}x\n\n"
+        f"EMA9 {fmt(ind['e9'])} > EMA20 {fmt(ind['e20'])} > VWAP {fmt(ind['vwap'])} > EMA200 {fmt(ind['e200'])}\n"
+        f"MACD {fmt(ind['macd'])} > Signal {fmt(ind['sig'])}\n\n"
+        f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+    )
+
+
+# ----------------------------- BINANCE REST ---------------------------------
+async def rest_get(session, path, params=None):
+    for host in REST_HOSTS:
+        try:
+            async with session.get(
+                f"https://{host}{path}", params=params, timeout=aiohttp.ClientTimeout(total=20)
+            ) as r:
+                if r.status == 200:
+                    return await r.json()
+                if r.status in (418, 429):
+                    await asyncio.sleep(5)
+                else:
+                    log.warning("REST %s%s -> HTTP %s", host, path, r.status)
+        except Exception as e:
+            log.warning("REST %s%s error: %r", host, path, e)
+    return None
+
+
+async def get_symbols(session):
+    info = await rest_get(session, "/api/v3/exchangeInfo")
+    if not info:
+        return []
+    out = []
+    for s in info["symbols"]:
+        if s.get("status") != "TRADING" or s.get("quoteAsset") != "USDT":
+            continue
+        if not s.get("isSpotTradingAllowed", True):
+            continue
+        base = s["baseAsset"]
+        if base in EXCLUDE_BASES or base.endswith(BAD_SUFFIXES):
+            continue
+        out.append(s["symbol"])
+    return sorted(out)
+
+
+async def seed_symbol(session, sym, sem):
+    async with sem:
+        rows = await rest_get(session, "/api/v3/klines",
+                              {"symbol": sym, "interval": "5m", "limit": HIST + 1})
+        await asyncio.sleep(0.05)
+    if not rows:
+        return False
+    now_ms = int(time.time() * 1000)
+    cs = [
+        (int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
+        for r in rows
+        if int(r[6]) < now_ms            # drop the still-forming candle
+    ]
+    st = STATE.setdefault(sym, Sym())
+    st.candles = cs[-HIST:]
+    st.setup = eval_setup(st.candles)
+    return True
+
+
+async def reseed(session, sym):
+    st = STATE.get(sym)
+    if not st or st.reseeding:
+        return
+    st.reseeding = True
+    try:
+        await seed_symbol(session, sym, asyncio.Semaphore(1))
+    finally:
+        st.reseeding = False
+
+
+# ----------------------------- STREAM HANDLING ------------------------------
+def handle_message(raw, session, loop_tasks):
+    global _last_beat, _alerts_sent
+    _last_beat = time.time()
+    d = json.loads(raw)
+    k = d.get("data", {}).get("k")
+    if not k:
+        return
+    sym = k["s"]
+    st = STATE.get(sym)
+    if st is None:
+        return
+
+    t = int(k["t"])
+    candle = (t, float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]))
+
+    if k["x"]:  # candle closed
+        cs = st.candles
+        if cs and cs[-1][0] == t:
+            cs[-1] = candle
+        elif not cs or t == cs[-1][0] + TF_MS:
+            cs.append(candle)
+            if len(cs) > HIST + 50:
+                del cs[:-HIST]
+        else:
+            # gap -> missed candles, reload history
+            st.setup = None
+            loop_tasks.append(asyncio.ensure_future(reseed(session, sym)))
+            return
+        st.setup = eval_setup(cs)
+        return
+
+    # live tick of forming candle
+    setup = st.setup
+    if not setup or st.alerted_t == t:
+        return
+    if t != setup["last_t"] + TF_MS:      # must be the candle right after the pullback
+        return
+    if candle[4] <= candle[1]:            # not green (yet)
+        return
+
+    ind = trend_check(st.candles, candle)
+    if not ind or not ind["ok"]:
+        return
+
+    st.alerted_t = t
+    _alerts_sent += 1
+    log.info("ALERT %s price=%s rvol=%.1fx retrace=%.1f%%", sym, fmt(candle[4]), setup["rvol"], setup["retrace"])
+    loop_tasks.append(asyncio.ensure_future(tg_send(session, build_alert(sym, candle, setup, ind))))
+
+
+async def ws_worker(idx, syms, session):
+    first = True
+    attempt = 0
+    pending = []
+    while True:
+        host = WS_HOSTS[attempt % len(WS_HOSTS)]
+        streams = "/".join(f"{s.lower()}@kline_5m" for s in syms)
+        url = f"wss://{host}/stream?streams={streams}"
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_queue=2048) as ws:
+                log.info("WS-%d connected (%s) %d streams", idx, host, len(syms))
+                if not first:
+                    for s in syms:
+                        pending.append(asyncio.ensure_future(reseed(session, s)))
+                first = False
+                attempt = 0
+                async for raw in ws:
+                    handle_message(raw, session, pending)
+                    if len(pending) > 200:
+                        pending[:] = [p for p in pending if not p.done()]
+        except Exception as e:
+            log.warning("WS-%d error: %r -> reconnecting", idx, e)
+            attempt += 1
+            await asyncio.sleep(min(5 * attempt, 30))
+
+
+# ----------------------------- WATCHDOG -------------------------------------
+def watchdog():
+    while True:
+        time.sleep(30)
+        if time.time() - _last_beat > WATCHDOG_SECONDS:
+            log.error("Watchdog: no stream data for %ss -> exiting for restart", WATCHDOG_SECONDS)
+            os._exit(1)
+
+
+async def health_logger():
+    while True:
+        await asyncio.sleep(1800)
+        armed = sum(1 for s in STATE.values() if s.setup)
+        log.info("HEALTH symbols=%d armed_setups=%d alerts_sent=%d", len(STATE), armed, _alerts_sent)
+
+
+# ----------------------------- MAIN -----------------------------------------
+async def main():
+    if not TOKEN or not CHAT_ID:
+        log.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway variables")
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    async with aiohttp.ClientSession() as session:
+        symbols = await get_symbols(session)
+        if not symbols:
+            log.error("Could not load symbols (Binance blocked? Set Railway region to EU West) -> exit")
+            os._exit(1)
+        log.info("Loaded %d USDT spot symbols, seeding history...", len(symbols))
+
+        sem = asyncio.Semaphore(8)
+        results = await asyncio.gather(*(seed_symbol(session, s, sem) for s in symbols))
+        ok = sum(1 for r in results if r)
+        log.info("Seeded %d/%d symbols", ok, len(symbols))
+        symbols = [s for s in symbols if s in STATE and STATE[s].candles]
+
+        global _last_beat
+        _last_beat = time.time()
+
+        chunks = [symbols[i:i + STREAMS_PER_CONN] for i in range(0, len(symbols), STREAMS_PER_CONN)]
+        tasks = [asyncio.create_task(ws_worker(i + 1, c, session)) for i, c in enumerate(chunks)]
+        tasks.append(asyncio.create_task(health_logger()))
+        await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
