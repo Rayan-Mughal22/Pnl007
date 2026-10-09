@@ -9,13 +9,14 @@ Strategy (5m chart), ALL must be true:
   5. Pullback = 1+ consecutive red candles right after the rally
   6. Pullback retracement < 20% of the rally range
   7. Rally volume bars clearly bigger than pullback red volume bars
+  8. Price between 0.01 and 20 USD (no coins like 0.00xx / 0.000xx)
   -> The moment the next candle turns green (live tick, no waiting for 5m close) => Telegram alert
 
 Environment variables (Railway -> Variables):
   TELEGRAM_BOT_TOKEN   (required)
   TELEGRAM_CHAT_ID     (required)
 Optional tuning:
-  RVOL_MIN (5), RVOL_PERIOD (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.20), SCAN_ALPHA (1 = on, 0 = off), VOL_DOMINANCE (1.5)
+  RVOL_MIN (5), RVOL_PERIOD (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.20), SCAN_ALPHA (1 = on, 0 = off), MIN_PRICE (0.01), MAX_PRICE (20), VOL_DOMINANCE (1.5)
 """
 
 import asyncio
@@ -43,6 +44,11 @@ MAX_RETRACE = float(os.getenv("MAX_RETRACE", "0.20"))
 # rally avg volume must be at least this many times the pullback avg volume
 # (and every pullback red candle must also be below the rally avg volume)
 VOL_DOMINANCE = float(os.getenv("VOL_DOMINANCE", "1.5"))
+
+# price filter: only coins priced from 0.01 USD (at most ONE zero after the decimal point,
+# e.g. 0.05 ok, 0.005 / 0.0005 not ok) up to 20 USD
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.01"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "20"))
 
 REST_HOSTS = ["api.binance.com", "data-api.binance.vision"]
 WS_HOSTS = ["stream.binance.com:9443", "data-stream.binance.vision"]
@@ -397,6 +403,8 @@ def handle_message(raw, session, loop_tasks):
     if t != setup["last_t"] + TF_MS:      # must be the candle right after the pullback
         return
     if candle[4] <= candle[1]:            # not green (yet)
+        return
+    if not (MIN_PRICE <= candle[4] <= MAX_PRICE):   # price filter
         return
 
     ind = trend_check(st.candles, candle)
