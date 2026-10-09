@@ -1,13 +1,13 @@
 """
-Binance Spot USDT Rally-Pullback Scanner  ->  Telegram instant alerts
+Binance Spot USDT + Binance Alpha Rally-Pullback Scanner  ->  Telegram instant alerts
 
 Strategy (5m chart), ALL must be true:
-  1. RVOL (volume / average of previous 50 candles) >= 5x on the rally
+  1. RVOL = average volume of the rally / average volume of the 50 candles before it >= 5x
   2. EMA9 > EMA20 > VWAP > EMA200   (EMA9 & EMA20 above VWAP, all three above EMA200)
   3. MACD line > MACD signal line
   4. Rally = 2 or more consecutive green candles
   5. Pullback = 1+ consecutive red candles right after the rally
-  6. Pullback retracement < 30% of the rally range
+  6. Pullback retracement < 20% of the rally range
   7. Rally volume bars clearly bigger than pullback red volume bars
   -> The moment the next candle turns green (live tick, no waiting for 5m close) => Telegram alert
 
@@ -15,7 +15,7 @@ Environment variables (Railway -> Variables):
   TELEGRAM_BOT_TOKEN   (required)
   TELEGRAM_CHAT_ID     (required)
 Optional tuning:
-  RVOL_MIN (5), RVOL_PERIOD (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.30), VOL_DOMINANCE (1.5)
+  RVOL_MIN (5), RVOL_PERIOD (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.20), SCAN_ALPHA (1 = on, 0 = off), VOL_DOMINANCE (1.5)
 """
 
 import asyncio
@@ -39,7 +39,7 @@ HIST = 500                                   # closed candles kept per symbol
 RVOL_PERIOD = int(os.getenv("RVOL_PERIOD", "50"))
 RVOL_MIN = float(os.getenv("RVOL_MIN", "5"))
 MIN_RALLY_CANDLES = int(os.getenv("MIN_RALLY_CANDLES", "2"))
-MAX_RETRACE = float(os.getenv("MAX_RETRACE", "0.30"))
+MAX_RETRACE = float(os.getenv("MAX_RETRACE", "0.20"))
 # rally avg volume must be at least this many times the pullback avg volume
 # (and every pullback red candle must also be below the rally avg volume)
 VOL_DOMINANCE = float(os.getenv("VOL_DOMINANCE", "1.5"))
@@ -47,6 +47,10 @@ VOL_DOMINANCE = float(os.getenv("VOL_DOMINANCE", "1.5"))
 REST_HOSTS = ["api.binance.com", "data-api.binance.vision"]
 WS_HOSTS = ["stream.binance.com:9443", "data-stream.binance.vision"]
 STREAMS_PER_CONN = 150
+SCAN_ALPHA = os.getenv("SCAN_ALPHA", "1") == "1"
+ALPHA_REST = "https://www.binance.com/bapi/defi/v1/public"
+ALPHA_WS = "wss://nbstream.binance.com/w3w/wsa/stream"
+ALPHA_STREAMS_PER_CONN = 100
 WATCHDOG_SECONDS = 180                       # no WS data for this long -> exit (Railway restarts)
 
 EXCLUDE_BASES = {
@@ -77,6 +81,7 @@ class Sym:
 
 
 STATE = {}
+META = {}   # key -> {"kind": "spot"|"alpha", "name": str, "chain": str, "contract": str}
 
 
 # ----------------------------- INDICATORS -----------------------------------
@@ -165,13 +170,12 @@ def eval_setup(cs):
     if max(x[5] for x in pb) >= avg_r:
         return None
 
-    # RVOL: best rally candle vs the 50 candles before it
-    best_rvol = 0.0
-    for k in range(rally_start, pb_start):
-        base = cs[k - RVOL_PERIOD:k]
-        ma = sum(x[5] for x in base) / RVOL_PERIOD
-        if ma > 0:
-            best_rvol = max(best_rvol, cs[k][5] / ma)
+    # RVOL (overall): average volume of the whole rally vs the 50-candle average volume before the rally
+    base = cs[rally_start - RVOL_PERIOD:rally_start]
+    ma = sum(x[5] for x in base) / RVOL_PERIOD
+    if ma <= 0:
+        return None
+    best_rvol = avg_r / ma
     if best_rvol < RVOL_MIN:
         return None
 
@@ -208,18 +212,26 @@ def fmt(x):
 
 
 def build_alert(sym, live, setup, ind):
-    base = sym[:-4]
+    meta = META.get(sym, {})
+    if meta.get("kind") == "alpha":
+        head = (f"ðŸš€ RALLY-PULLBACK ALERT (5m) - BINANCE ALPHA\n"
+                f"{meta.get('name', sym)} ({sym})\n"
+                f"Chain ID: {meta.get('chain', '?')}\n"
+                f"Contract: {meta.get('contract', '?')}\n")
+        link = ""
+    else:
+        head = f"ðŸš€ RALLY-PULLBACK ALERT (5m)\n{sym}\n"
+        link = f"\n\nhttps://www.binance.com/en/trade/{sym[:-4]}_USDT?type=spot"
     return (
-        f"ðŸš€ RALLY-PULLBACK ALERT (5m)\n"
-        f"{sym}\n"
+        f"{head}"
         f"Price: {fmt(live[4])}  (green candle open: {fmt(live[1])})\n\n"
         f"Rally: {setup['rally_n']} green | Pullback: {setup['pb_n']} red\n"
         f"Retracement: {setup['retrace']:.1f}% (max {MAX_RETRACE * 100:.0f}%)\n"
-        f"RVOL (peak rally, {RVOL_PERIOD}p): {setup['rvol']:.1f}x (min {RVOL_MIN:g}x)\n"
+        f"RVOL (rally avg vs {RVOL_PERIOD}p avg): {setup['rvol']:.1f}x (min {RVOL_MIN:g}x)\n"
         f"Rally vol / pullback vol: {setup['vol_ratio']:.1f}x\n\n"
         f"EMA9 {fmt(ind['e9'])} > EMA20 {fmt(ind['e20'])} > VWAP {fmt(ind['vwap'])} > EMA200 {fmt(ind['e200'])}\n"
-        f"MACD {fmt(ind['macd'])} > Signal {fmt(ind['sig'])}\n\n"
-        f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+        f"MACD {fmt(ind['macd'])} > Signal {fmt(ind['sig'])}"
+        f"{link}"
     )
 
 
@@ -244,8 +256,9 @@ async def rest_get(session, path, params=None):
 async def get_symbols(session):
     info = await rest_get(session, "/api/v3/exchangeInfo")
     if not info:
-        return []
+        return [], set()
     out = []
+    bases = set()
     for s in info["symbols"]:
         if s.get("status") != "TRADING" or s.get("quoteAsset") != "USDT":
             continue
@@ -255,21 +268,74 @@ async def get_symbols(session):
         if base in EXCLUDE_BASES or base.endswith(BAD_SUFFIXES):
             continue
         out.append(s["symbol"])
+        bases.add(base.upper())
+        META[s["symbol"]] = {"kind": "spot", "name": s["symbol"]}
+    return sorted(out), bases
+
+
+async def get_alpha_tokens(session, spot_bases):
+    """Binance Alpha tokens -> keys like ALPHA_175USDT (skips tokens already scanned on spot)."""
+    try:
+        async with session.get(
+            f"{ALPHA_REST}/wallet-direct/buw/wallet/cex/alpha/all/token/list",
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            if r.status != 200:
+                log.warning("Alpha token list HTTP %s", r.status)
+                return []
+            data = (await r.json()).get("data") or []
+    except Exception as e:
+        log.warning("Alpha token list error: %r", e)
+        return []
+    out = []
+    for t in data:
+        aid = t.get("alphaId")
+        if not aid:
+            continue
+        cex = (t.get("cexCoinName") or "").upper()
+        if cex and cex in spot_bases:      # already covered by the spot scan
+            continue
+        key = f"{aid}USDT".upper()
+        if key in META:
+            continue
+        META[key] = {
+            "kind": "alpha",
+            "name": t.get("symbol") or str(aid),
+            "chain": str(t.get("chainId", "?")),
+            "contract": t.get("contractAddress", "?"),
+        }
+        out.append(key)
     return sorted(out)
 
 
 async def seed_symbol(session, sym, sem):
     async with sem:
-        rows = await rest_get(session, "/api/v3/klines",
-                              {"symbol": sym, "interval": "5m", "limit": HIST + 1})
-        await asyncio.sleep(0.05)
+        if META.get(sym, {}).get("kind") == "alpha":
+            rows = None
+            try:
+                async with session.get(
+                    f"{ALPHA_REST}/alpha-trade/klines",
+                    params={"symbol": sym, "interval": "5m", "limit": HIST + 1},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as r:
+                    if r.status == 200:
+                        rows = (await r.json()).get("data")
+                    elif r.status in (418, 429):
+                        await asyncio.sleep(5)
+            except Exception as e:
+                log.warning("Alpha klines %s error: %r", sym, e)
+            await asyncio.sleep(0.15)
+        else:
+            rows = await rest_get(session, "/api/v3/klines",
+                                  {"symbol": sym, "interval": "5m", "limit": HIST + 1})
+            await asyncio.sleep(0.05)
     if not rows:
         return False
     now_ms = int(time.time() * 1000)
     cs = [
         (int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
         for r in rows
-        if int(r[6]) < now_ms            # drop the still-forming candle
+        if (int(r[6]) if len(r) > 6 else int(r[0]) + TF_MS - 1) < now_ms   # drop the still-forming candle
     ]
     st = STATE.setdefault(sym, Sym())
     st.candles = cs[-HIST:]
@@ -293,10 +359,11 @@ def handle_message(raw, session, loop_tasks):
     global _last_beat, _alerts_sent
     _last_beat = time.time()
     d = json.loads(raw)
-    k = d.get("data", {}).get("k")
+    payload = d.get("data", d) if isinstance(d, dict) else None
+    k = payload.get("k") if isinstance(payload, dict) else None
     if not k:
         return
-    sym = k["s"]
+    sym = (k.get("s") or payload.get("s") or str(d.get("stream", "")).split("@")[0]).upper()
     st = STATE.get(sym)
     if st is None:
         return
@@ -312,8 +379,11 @@ def handle_message(raw, session, loop_tasks):
             cs.append(candle)
             if len(cs) > HIST + 50:
                 del cs[:-HIST]
+        elif META.get(sym, {}).get("kind") == "alpha":
+            # Alpha: no trades in a 5m window = no candle, so a gap is normal
+            cs.append(candle)
         else:
-            # gap -> missed candles, reload history
+            # spot gap -> missed candles, reload history
             st.setup = None
             loop_tasks.append(asyncio.ensure_future(reseed(session, sym)))
             return
@@ -365,6 +435,33 @@ async def ws_worker(idx, syms, session):
             await asyncio.sleep(min(5 * attempt, 30))
 
 
+async def alpha_ws_worker(idx, syms, session):
+    first = True
+    attempt = 0
+    pending = []
+    while True:
+        try:
+            async with websockets.connect(ALPHA_WS, ping_interval=20, ping_timeout=20, max_queue=2048) as ws:
+                for i in range(0, len(syms), 50):
+                    batch = [f"{s.lower()}@kline_5m" for s in syms[i:i + 50]]
+                    await ws.send(json.dumps({"method": "SUBSCRIBE", "params": batch, "id": i + 1}))
+                    await asyncio.sleep(0.3)
+                log.info("ALPHA-WS-%d connected, %d streams", idx, len(syms))
+                if not first:
+                    for s in syms:
+                        pending.append(asyncio.ensure_future(reseed(session, s)))
+                first = False
+                attempt = 0
+                async for raw in ws:
+                    handle_message(raw, session, pending)
+                    if len(pending) > 200:
+                        pending[:] = [p for p in pending if not p.done()]
+        except Exception as e:
+            log.warning("ALPHA-WS-%d error: %r -> reconnecting", idx, e)
+            attempt += 1
+            await asyncio.sleep(min(5 * attempt, 30))
+
+
 # ----------------------------- WATCHDOG -------------------------------------
 def watchdog():
     while True:
@@ -388,23 +485,26 @@ async def main():
     threading.Thread(target=watchdog, daemon=True).start()
 
     async with aiohttp.ClientSession() as session:
-        symbols = await get_symbols(session)
+        symbols, spot_bases = await get_symbols(session)
         if not symbols:
             log.error("Could not load symbols (Binance blocked? Set Railway region to EU West) -> exit")
             os._exit(1)
-        log.info("Loaded %d USDT spot symbols, seeding history...", len(symbols))
+        alpha = await get_alpha_tokens(session, spot_bases) if SCAN_ALPHA else []
+        log.info("Loaded %d spot USDT symbols + %d Alpha tokens, seeding history...", len(symbols), len(alpha))
 
-        sem = asyncio.Semaphore(8)
-        results = await asyncio.gather(*(seed_symbol(session, s, sem) for s in symbols))
-        ok = sum(1 for r in results if r)
-        log.info("Seeded %d/%d symbols", ok, len(symbols))
+        sem = asyncio.Semaphore(6)
+        results = await asyncio.gather(*(seed_symbol(session, s, sem) for s in symbols + alpha))
+        log.info("Seeded %d/%d symbols", sum(1 for r in results if r), len(results))
         symbols = [s for s in symbols if s in STATE and STATE[s].candles]
+        alpha = [s for s in alpha if s in STATE and STATE[s].candles]
 
         global _last_beat
         _last_beat = time.time()
 
         chunks = [symbols[i:i + STREAMS_PER_CONN] for i in range(0, len(symbols), STREAMS_PER_CONN)]
         tasks = [asyncio.create_task(ws_worker(i + 1, c, session)) for i, c in enumerate(chunks)]
+        achunks = [alpha[i:i + ALPHA_STREAMS_PER_CONN] for i in range(0, len(alpha), ALPHA_STREAMS_PER_CONN)]
+        tasks += [asyncio.create_task(alpha_ws_worker(i + 1, c, session)) for i, c in enumerate(achunks)]
         tasks.append(asyncio.create_task(health_logger()))
         await asyncio.gather(*tasks)
 
