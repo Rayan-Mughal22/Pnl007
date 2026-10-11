@@ -2,7 +2,8 @@
 Binance Spot USDT + Binance Alpha Rally-Pullback Scanner  ->  Telegram instant alerts
 
 Strategy (5m chart), ALL must be true:
-  1. RVOL = average volume of the rally / average volume of the 50 candles before it >= 5x
+  1. RVOL = average 5m-candle volume of the rally / normal 5m-candle volume from the 50-DAY average >= 5x
+     (normal 5m volume = average daily volume of the last 50 days / 288)
   2. EMA9 > EMA20 > VWAP > EMA200   (EMA9 & EMA20 above VWAP, all three above EMA200)
   3. MACD line > MACD signal line
   4. Rally = 2 or more consecutive green candles
@@ -16,7 +17,7 @@ Environment variables (Railway -> Variables):
   TELEGRAM_BOT_TOKEN   (required)
   TELEGRAM_CHAT_ID     (required)
 Optional tuning:
-  RVOL_MIN (5), RVOL_PERIOD (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.20), SCAN_ALPHA (1 = on, 0 = off), MIN_PRICE (0.01), MAX_PRICE (20), VOL_DOMINANCE (1.5)
+  RVOL_MIN (5), RVOL_DAYS (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.20), SCAN_ALPHA (1 = on, 0 = off), MIN_PRICE (0.01), MAX_PRICE (20), VOL_DOMINANCE (1.5)
 """
 
 import asyncio
@@ -37,7 +38,9 @@ TF_MS = 5 * 60 * 1000
 DAY_MS = 24 * 60 * 60 * 1000
 HIST = 500                                   # closed candles kept per symbol
 
-RVOL_PERIOD = int(os.getenv("RVOL_PERIOD", "50"))
+RVOL_DAYS = int(os.getenv("RVOL_DAYS", "50"))
+MIN_BASE_DAYS = 7                            # new coins: need at least this many closed days of history
+REST_SEM = None                              # set in main()
 RVOL_MIN = float(os.getenv("RVOL_MIN", "5"))
 MIN_RALLY_CANDLES = int(os.getenv("MIN_RALLY_CANDLES", "2"))
 MAX_RETRACE = float(os.getenv("MAX_RETRACE", "0.20"))
@@ -77,13 +80,15 @@ _alerts_sent = 0
 
 
 class Sym:
-    __slots__ = ("candles", "setup", "alerted_t", "reseeding")
+    __slots__ = ("candles", "setup", "alerted_t", "reseeding", "base", "base_day")
 
     def __init__(self):
         self.candles = []        # closed candles: (t, o, h, l, c, v)
         self.setup = None        # valid rally+pullback setup computed on last closed candle
         self.alerted_t = 0       # open time of the candle we already alerted on
         self.reseeding = False
+        self.base = None         # normal volume of ONE 5m candle = 50-day avg daily volume / 288
+        self.base_day = 0        # UTC day number the baseline was computed on
 
 
 STATE = {}
@@ -133,10 +138,10 @@ def trend_check(closed, live):
     return {"ok": ok, "e9": e9, "e20": e20, "vwap": vwap, "e200": e200, "macd": m, "sig": sig}
 
 
-def eval_setup(cs):
+def eval_setup(cs, base):
     """Rally (2+ green) -> pullback (red candles) check on CLOSED candles only."""
     n = len(cs)
-    if n < RVOL_PERIOD + MIN_RALLY_CANDLES + 2:
+    if not base or base <= 0 or n < MIN_RALLY_CANDLES + 2:
         return None
 
     # pullback = trailing run of red candles
@@ -154,7 +159,7 @@ def eval_setup(cs):
     rally_start = j + 1
     rally = cs[rally_start:pb_start]
     pb = cs[pb_start:]
-    if len(rally) < MIN_RALLY_CANDLES or rally_start < RVOL_PERIOD:
+    if len(rally) < MIN_RALLY_CANDLES:
         return None
 
     # retracement must be < 30% of rally range
@@ -176,12 +181,8 @@ def eval_setup(cs):
     if max(x[5] for x in pb) >= avg_r:
         return None
 
-    # RVOL (overall): average volume of the whole rally vs the 50-candle average volume before the rally
-    base = cs[rally_start - RVOL_PERIOD:rally_start]
-    ma = sum(x[5] for x in base) / RVOL_PERIOD
-    if ma <= 0:
-        return None
-    best_rvol = avg_r / ma
+    # RVOL (overall): average 5m volume of the whole rally vs normal 5m volume from the 50-day average
+    best_rvol = avg_r / base
     if best_rvol < RVOL_MIN:
         return None
 
@@ -233,7 +234,7 @@ def build_alert(sym, live, setup, ind):
         f"Price: {fmt(live[4])}  (green candle open: {fmt(live[1])})\n\n"
         f"Rally: {setup['rally_n']} green | Pullback: {setup['pb_n']} red\n"
         f"Retracement: {setup['retrace']:.1f}% (max {MAX_RETRACE * 100:.0f}%)\n"
-        f"RVOL (rally avg vs {RVOL_PERIOD}p avg): {setup['rvol']:.1f}x (min {RVOL_MIN:g}x)\n"
+        f"RVOL (rally vs {RVOL_DAYS}-day avg): {setup['rvol']:.1f}x (min {RVOL_MIN:g}x)\n"
         f"Rally vol / pullback vol: {setup['vol_ratio']:.1f}x\n\n"
         f"EMA9 {fmt(ind['e9'])} > EMA20 {fmt(ind['e20'])} > VWAP {fmt(ind['vwap'])} > EMA200 {fmt(ind['e200'])}\n"
         f"MACD {fmt(ind['macd'])} > Signal {fmt(ind['sig'])}"
@@ -314,27 +315,54 @@ async def get_alpha_tokens(session, spot_bases):
     return sorted(out)
 
 
+async def fetch_rows(session, sym, interval, limit):
+    if META.get(sym, {}).get("kind") == "alpha":
+        rows = None
+        try:
+            async with session.get(
+                f"{ALPHA_REST}/alpha-trade/klines",
+                params={"symbol": sym, "interval": interval, "limit": limit},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status == 200:
+                    rows = (await r.json()).get("data")
+                elif r.status in (418, 429):
+                    await asyncio.sleep(5)
+        except Exception as e:
+            log.warning("Alpha klines %s error: %r", sym, e)
+        await asyncio.sleep(0.15)
+        return rows
+    rows = await rest_get(session, "/api/v3/klines", {"symbol": sym, "interval": interval, "limit": limit})
+    await asyncio.sleep(0.05)
+    return rows
+
+
+async def load_base(session, sym):
+    """50-day average daily volume -> normal volume of one 5m candle. Returns True on success."""
+    rows = await fetch_rows(session, sym, "1d", RVOL_DAYS + 1)
+    if not rows:
+        return False
+    now_ms = int(time.time() * 1000)
+    vols = [
+        float(r[5]) for r in rows
+        if (int(r[6]) if len(r) > 6 else int(r[0]) + DAY_MS - 1) < now_ms    # closed days only
+    ][-RVOL_DAYS:]
+    if len(vols) < MIN_BASE_DAYS:
+        return False
+    avg_day = sum(vols) / len(vols)
+    st = STATE.setdefault(sym, Sym())
+    st.base = avg_day / (DAY_MS // TF_MS) if avg_day > 0 else None
+    st.base_day = int(time.time() * 1000) // DAY_MS
+    return st.base is not None
+
+
 async def seed_symbol(session, sym, sem):
     async with sem:
-        if META.get(sym, {}).get("kind") == "alpha":
-            rows = None
-            try:
-                async with session.get(
-                    f"{ALPHA_REST}/alpha-trade/klines",
-                    params={"symbol": sym, "interval": "5m", "limit": HIST + 1},
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as r:
-                    if r.status == 200:
-                        rows = (await r.json()).get("data")
-                    elif r.status in (418, 429):
-                        await asyncio.sleep(5)
-            except Exception as e:
-                log.warning("Alpha klines %s error: %r", sym, e)
-            await asyncio.sleep(0.15)
-        else:
-            rows = await rest_get(session, "/api/v3/klines",
-                                  {"symbol": sym, "interval": "5m", "limit": HIST + 1})
-            await asyncio.sleep(0.05)
+        rows = await fetch_rows(session, sym, "5m", HIST + 1)
+        st0 = STATE.get(sym)
+        today = int(time.time() * 1000) // DAY_MS
+        if rows and (st0 is None or st0.base is None or st0.base_day != today):
+            await load_base(session, sym)
     if not rows:
         return False
     now_ms = int(time.time() * 1000)
@@ -345,8 +373,19 @@ async def seed_symbol(session, sym, sem):
     ]
     st = STATE.setdefault(sym, Sym())
     st.candles = cs[-HIST:]
-    st.setup = eval_setup(st.candles)
+    st.setup = eval_setup(st.candles, st.base)
     return True
+
+
+async def refresh_base(session, sym):
+    """New UTC day -> recompute the 50-day baseline."""
+    st = STATE.get(sym)
+    if not st:
+        return
+    st.base_day = int(time.time() * 1000) // DAY_MS      # mark first so we don't spawn duplicates
+    async with REST_SEM:
+        await load_base(session, sym)
+    st.setup = eval_setup(st.candles, st.base)
 
 
 async def reseed(session, sym):
@@ -393,7 +432,9 @@ def handle_message(raw, session, loop_tasks):
             st.setup = None
             loop_tasks.append(asyncio.ensure_future(reseed(session, sym)))
             return
-        st.setup = eval_setup(cs)
+        st.setup = eval_setup(cs, st.base)
+        if t // DAY_MS != st.base_day and (int(time.time() * 1000) // DAY_MS) != st.base_day:
+            loop_tasks.append(asyncio.ensure_future(refresh_base(session, sym)))
         return
 
     # live tick of forming candle
@@ -500,11 +541,13 @@ async def main():
         alpha = await get_alpha_tokens(session, spot_bases) if SCAN_ALPHA else []
         log.info("Loaded %d spot USDT symbols + %d Alpha tokens, seeding history...", len(symbols), len(alpha))
 
+        global REST_SEM
+        REST_SEM = asyncio.Semaphore(4)
         sem = asyncio.Semaphore(6)
         results = await asyncio.gather(*(seed_symbol(session, s, sem) for s in symbols + alpha))
         log.info("Seeded %d/%d symbols", sum(1 for r in results if r), len(results))
-        symbols = [s for s in symbols if s in STATE and STATE[s].candles]
-        alpha = [s for s in alpha if s in STATE and STATE[s].candles]
+        symbols = [s for s in symbols if s in STATE and STATE[s].candles and STATE[s].base]
+        alpha = [s for s in alpha if s in STATE and STATE[s].candles and STATE[s].base]
 
         global _last_beat
         _last_beat = time.time()
