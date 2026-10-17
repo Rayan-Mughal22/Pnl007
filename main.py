@@ -10,15 +10,14 @@ Strategy (5m chart), ALL must be true:
   5. Pullback = 1+ consecutive red candles right after the rally
   6. Pullback retracement < 10% of the rally range
   7. Rally volume bars clearly bigger than pullback red volume bars
-  8. Rally BUYING volume (taker buy volume) >= 1.5x the pullback buying volume (per-candle average)
-  9. Price between 0.01 and 20 USD (no coins like 0.00xx / 0.000xx)
+  8. Price between 0.01 and 20 USD (no coins like 0.00xx / 0.000xx)
   -> The moment the next candle turns green (live tick, no waiting for 5m close) => Telegram alert
 
 Environment variables (Railway -> Variables):
   TELEGRAM_BOT_TOKEN   (required)
   TELEGRAM_CHAT_ID     (required)
 Optional tuning:
-  RVOL_MIN (5), RVOL_DAYS (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.10), BUY_DOMINANCE (1.5), SCAN_ALPHA (1 = on, 0 = off), MIN_PRICE (0.01), MAX_PRICE (20), VOL_DOMINANCE (1.5)
+  RVOL_MIN (5), RVOL_DAYS (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.10), SCAN_ALPHA (1 = on, 0 = off), MIN_PRICE (0.01), MAX_PRICE (20), VOL_DOMINANCE (1.5)
 """
 
 import asyncio
@@ -48,8 +47,6 @@ MAX_RETRACE = float(os.getenv("MAX_RETRACE", "0.10"))
 # rally avg volume must be at least this many times the pullback avg volume
 # (and every pullback red candle must also be below the rally avg volume)
 VOL_DOMINANCE = float(os.getenv("VOL_DOMINANCE", "1.5"))
-# rally taker-BUY volume (avg per candle) must be at least this many times the pullback taker-buy volume
-BUY_DOMINANCE = float(os.getenv("BUY_DOMINANCE", "1.5"))
 
 # price filter: only coins priced from 0.01 USD (at most ONE zero after the decimal point,
 # e.g. 0.05 ok, 0.005 / 0.0005 not ok) up to 20 USD
@@ -189,22 +186,7 @@ def eval_setup(cs, base):
     if best_rvol < RVOL_MIN:
         return None
 
-    # buying pressure: taker-buy volume of the rally vs the pullback (average per candle)
-    rb = [x[6] if len(x) > 6 else None for x in rally]
-    pbb = [x[6] if len(x) > 6 else None for x in pb]
-    if any(v is None for v in rb) or any(v is None for v in pbb):
-        return {"need_buy": True}           # everything else passed, buy data still missing
-    avg_rb = sum(rb) / len(rb)
-    avg_pb = sum(pbb) / len(pbb)
-    if avg_pb <= 0:
-        buy_ratio = 999.0 if avg_rb > 0 else 0.0
-    else:
-        buy_ratio = avg_rb / avg_pb
-    if buy_ratio < BUY_DOMINANCE:
-        return None
-
     return {
-        "buy_ratio": buy_ratio,
         "last_t": cs[-1][0],
         "rally_n": len(rally),
         "pb_n": len(pb),
@@ -254,7 +236,7 @@ def build_alert(sym, live, setup, ind):
         f"Retracement: {setup['retrace']:.1f}% (max {MAX_RETRACE * 100:.0f}%)\n"
         f"RVOL (rally vs {RVOL_DAYS}-day avg): {setup['rvol']:.1f}x (min {RVOL_MIN:g}x)\n"
         f"Rally vol / pullback vol: {setup['vol_ratio']:.1f}x\n"
-        f"Rally BUY vol / pullback BUY vol: {setup['buy_ratio']:.1f}x (min {BUY_DOMINANCE:g}x)\n\n"
+        f"\n"
         f"EMA9 {fmt(ind['e9'])} > EMA20 {fmt(ind['e20'])} > VWAP {fmt(ind['vwap'])} > EMA200 {fmt(ind['e200'])}\n"
         f"MACD {fmt(ind['macd'])} > Signal {fmt(ind['sig'])}"
         f"{link}"
@@ -388,15 +370,13 @@ async def seed_symbol(session, sym, sem):
         return False
     now_ms = int(time.time() * 1000)
     cs = [
-        (int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]),
-         float(r[9]) if len(r) > 9 else None)
+        (int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
         for r in rows
         if (int(r[6]) if len(r) > 6 else int(r[0]) + TF_MS - 1) < now_ms   # drop the still-forming candle
     ]
     st = STATE.setdefault(sym, Sym())
     st.candles = cs[-HIST:]
-    res = eval_setup(st.candles, st.base)
-    st.setup = None if (res and res.get("need_buy")) else res
+    st.setup = eval_setup(st.candles, st.base)
     return True
 
 
@@ -408,27 +388,7 @@ async def refresh_base(session, sym):
     st.base_day = int(time.time() * 1000) // DAY_MS      # mark first so we don't spawn duplicates
     async with REST_SEM:
         await load_base(session, sym)
-    res = eval_setup(st.candles, st.base)
-    st.setup = None if (res and res.get("need_buy")) else res
-
-
-async def patch_buy(session, sym):
-    """Fill missing taker-buy volume (e.g. Alpha stream without it) from REST, then re-check the setup."""
-    st = STATE.get(sym)
-    if not st:
-        return
-    async with REST_SEM:
-        rows = await fetch_rows(session, sym, "5m", 60)
-    if not rows:
-        st.setup = None
-        return
-    tb = {int(r[0]): float(r[9]) for r in rows if len(r) > 9}
-    cs = st.candles
-    for i in range(max(0, len(cs) - 60), len(cs)):
-        if (len(cs[i]) < 7 or cs[i][6] is None) and cs[i][0] in tb:
-            cs[i] = cs[i][:6] + (tb[cs[i][0]],)
-    res = eval_setup(cs, st.base)
-    st.setup = None if (res and res.get("need_buy")) else res
+    st.setup = eval_setup(st.candles, st.base)
 
 
 async def reseed(session, sym):
@@ -457,8 +417,7 @@ def handle_message(raw, session, loop_tasks):
         return
 
     t = int(k["t"])
-    candle = (t, float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]),
-              float(k["V"]) if k.get("V") is not None else None)
+    candle = (t, float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]))
 
     if k["x"]:  # candle closed
         cs = st.candles
@@ -477,16 +436,13 @@ def handle_message(raw, session, loop_tasks):
             loop_tasks.append(asyncio.ensure_future(reseed(session, sym)))
             return
         st.setup = eval_setup(cs, st.base)
-        if st.setup and st.setup.get("need_buy"):
-            st.setup = None
-            loop_tasks.append(asyncio.ensure_future(patch_buy(session, sym)))
         if t // DAY_MS != st.base_day and (int(time.time() * 1000) // DAY_MS) != st.base_day:
             loop_tasks.append(asyncio.ensure_future(refresh_base(session, sym)))
         return
 
     # live tick of forming candle
     setup = st.setup
-    if not setup or setup.get("need_buy") or st.alerted_t == t:
+    if not setup or st.alerted_t == t:
         return
     if t != setup["last_t"] + TF_MS:      # must be the candle right after the pullback
         return
