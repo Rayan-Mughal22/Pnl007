@@ -1,7 +1,7 @@
 """
-Binance Spot USDT + Binance Alpha Rally-Pullback Scanner  ->  Telegram instant alerts
+Binance Spot USDT + Binance Alpha  Rally-Pullback  DEMO TRADING BOT  (virtual money, Telegram statements)
 
-Strategy (5m chart), ALL must be true:
+SETUP (5m chart) - ALL must be true:
   1. RVOL = average 5m-candle volume of the rally / normal 5m-candle volume from the 50-DAY average >= 5x
      (normal 5m volume = average daily volume of the last 50 days / 288)
   2. EMA9 > EMA20 > VWAP > EMA200   (EMA9 & EMA20 above VWAP, all three above EMA200)
@@ -11,13 +11,32 @@ Strategy (5m chart), ALL must be true:
   6. Pullback retracement < 10% of the rally range
   7. Rally volume bars clearly bigger than pullback red volume bars
   8. Price between 0.01 and 20 USD (no coins like 0.00xx / 0.000xx)
-  -> The moment the next candle turns green (live tick, no waiting for 5m close) => Telegram alert
+
+ENTRY (virtual buy):
+  The instant price breaks ABOVE the high of the pullback's FIRST red candle (on a green candle),
+  with the trend filters (2, 3) still true at that moment.
+  Only on the 2nd and 3rd rally of a chain:
+     rally1 + pullback1  -> breakout = rally2 entry
+     rally2 ends (exit), pullback2 forms -> breakout = rally3 entry
+  After a rally3 entry no more entries on that coin until the chain resets (1 hour).
+
+EXIT (no stop-loss order, two rules, both on LIVE price):
+  a) price falls back below the breakout level -> sell immediately
+  b) a new red candle starts after the entry candle (price < that candle's open) -> sell immediately
+
+MONEY (demo): pool = 1100 USD (+ net PnL), 500 USD per trade, fees 0.1% per side.
+  Two trades can run together while the free pool is >= 500 USD for each.
+
+Telegram / logs: NO scanning messages. Only a detailed statement when a trade opens and when it closes.
+Open trades + totals are saved in an edited-in-place pinned Telegram message (survives restarts / redeploys).
 
 Environment variables (Railway -> Variables):
   TELEGRAM_BOT_TOKEN   (required)
   TELEGRAM_CHAT_ID     (required)
 Optional tuning:
-  RVOL_MIN (5), RVOL_DAYS (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.10), SCAN_ALPHA (1 = on, 0 = off), MIN_PRICE (0.01), MAX_PRICE (20), VOL_DOMINANCE (1.5)
+  START_CAPITAL (1100), TRADE_SIZE (500), FEE_PCT (0.1), MAX_WAIT_CANDLES (3),
+  RVOL_MIN (5), RVOL_DAYS (50), MIN_RALLY_CANDLES (2), MAX_RETRACE (0.10), VOL_DOMINANCE (1.5),
+  MIN_PRICE (0.01), MAX_PRICE (20), SCAN_ALPHA (1 = on, 0 = off)
 """
 
 import asyncio
@@ -26,6 +45,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 import aiohttp
 import websockets
@@ -53,6 +73,15 @@ VOL_DOMINANCE = float(os.getenv("VOL_DOMINANCE", "1.5"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.01"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "20"))
 
+# demo account
+START_CAPITAL = float(os.getenv("START_CAPITAL", "1100"))
+TRADE_SIZE = float(os.getenv("TRADE_SIZE", "500"))
+FEE_PCT = float(os.getenv("FEE_PCT", "0.1"))                 # per side
+MAX_WAIT_CANDLES = int(os.getenv("MAX_WAIT_CANDLES", "3"))   # how long to wait for the breakout after the pullback
+CHAIN_RESET_MS = 12 * TF_MS                                  # rally2/rally3 chain resets after 1 hour
+STATE_PATH = os.getenv("STATE_PATH", "/tmp/demo_state.json")
+STATE_MARK = "DEMO-STATE"
+
 REST_HOSTS = ["api.binance.com", "data-api.binance.vision"]
 WS_HOSTS = ["stream.binance.com:9443", "data-stream.binance.vision"]
 STREAMS_PER_CONN = 150
@@ -76,19 +105,20 @@ logging.basicConfig(
 log = logging.getLogger("scanner")
 
 _last_beat = time.time()
-_alerts_sent = 0
 
 
 class Sym:
-    __slots__ = ("candles", "setup", "alerted_t", "reseeding", "base", "base_day")
+    __slots__ = ("candles", "arm", "reseeding", "base", "base_day", "chain_n", "chain_t", "chain_entry_t")
 
     def __init__(self):
         self.candles = []        # closed candles: (t, o, h, l, c, v)
-        self.setup = None        # valid rally+pullback setup computed on last closed candle
-        self.alerted_t = 0       # open time of the candle we already alerted on
+        self.arm = None          # valid setup waiting for the breakout
         self.reseeding = False
         self.base = None         # normal volume of ONE 5m candle = 50-day avg daily volume / 288
         self.base_day = 0        # UTC day number the baseline was computed on
+        self.chain_n = 0         # entries taken in the current rally2/rally3 chain
+        self.chain_t = 0         # ms time of the last exit in the chain
+        self.chain_entry_t = 0   # open time of the last entry candle
 
 
 STATE = {}
@@ -188,6 +218,11 @@ def eval_setup(cs, base):
 
     return {
         "last_t": cs[-1][0],
+        "pb_start_t": pb[0][0],
+        "level": pb[0][2],                 # high of the pullback's FIRST red candle = breakout level
+        "r_high": r_high,
+        "rng": rng,
+        "pb_low": pb_low,
         "rally_n": len(rally),
         "pb_n": len(pb),
         "retrace": retrace * 100,
@@ -197,20 +232,30 @@ def eval_setup(cs, base):
 
 
 # ----------------------------- TELEGRAM -------------------------------------
-async def tg_send(session, text):
+SESSION = None
+
+
+async def tg_api(method, payload):
     if not TOKEN or not CHAT_ID:
-        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing")
-        return
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+        return None
+    try:
+        async with SESSION.post(
+            f"https://api.telegram.org/bot{TOKEN}/{method}", json=payload,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            return await r.json()
+    except Exception as e:
+        log.warning("Telegram %s error: %r", method, e)
+        return None
+
+
+async def tg_send(text):
     for attempt in range(3):
-        try:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status == 200:
-                    return
-                log.warning("Telegram HTTP %s: %s", r.status, (await r.text())[:200])
-        except Exception as e:
-            log.warning("Telegram error: %r", e)
+        r = await tg_api("sendMessage", {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True})
+        if r and r.get("ok"):
+            return
+        if r:
+            log.warning("Telegram send failed: %s", str(r)[:200])
         await asyncio.sleep(2 * (attempt + 1))
 
 
@@ -218,29 +263,274 @@ def fmt(x):
     return f"{x:.8g}"
 
 
-def build_alert(sym, live, setup, ind):
+def money(x, sign=False):
+    return f"{x:+,.2f}" if sign else f"{x:,.2f}"
+
+
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def emit(text):
+    """One statement -> Railway logs + Telegram (identical content)."""
+    log.info("\n%s", text)
+    asyncio.ensure_future(tg_send(text))
+
+
+# ----------------------------- DEMO ACCOUNT ---------------------------------
+STATS = {"pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}
+POSITIONS = {}          # sym -> position dict (JSON-serialisable)
+_state_msg_id = None
+_save_dirty = False
+_save_running = False
+
+
+def pool_free():
+    pool = START_CAPITAL + STATS["pnl"]
+    return pool, pool - TRADE_SIZE * len(POSITIONS)
+
+
+def name_block(sym):
     meta = META.get(sym, {})
     if meta.get("kind") == "alpha":
-        head = (f"🚀 RALLY-PULLBACK ALERT (5m) - BINANCE ALPHA\n"
-                f"{meta.get('name', sym)}/USDT  ({sym})\n"
-                f"Chain: {meta.get('chain', '?')}\n"
-                f"Contract: {meta.get('contract', '?')}\n")
-        link = ""
-    else:
-        head = f"🚀 RALLY-PULLBACK ALERT (5m)\n{sym[:-4]}/USDT\n"
-        link = f"\n\nhttps://www.binance.com/en/trade/{sym[:-4]}_USDT?type=spot"
-    return (
-        f"{head}"
-        f"Price: {fmt(live[4])}  (green candle open: {fmt(live[1])})\n\n"
-        f"Rally: {setup['rally_n']} green | Pullback: {setup['pb_n']} red\n"
-        f"Retracement: {setup['retrace']:.1f}% (max {MAX_RETRACE * 100:.0f}%)\n"
-        f"RVOL (rally vs {RVOL_DAYS}-day avg): {setup['rvol']:.1f}x (min {RVOL_MIN:g}x)\n"
-        f"Rally vol / pullback vol: {setup['vol_ratio']:.1f}x\n"
-        f"\n"
+        return (f"{meta.get('name', sym)}/USDT  [BINANCE ALPHA]\n"
+                f"Alpha ID: {sym}\nChain: {meta.get('chain', '?')}\nContract: {meta.get('contract', '?')}")
+    return f"{sym[:-4]}/USDT  [SPOT]"
+
+
+def account_lines():
+    pool, free = pool_free()
+    n = STATS["trades"]
+    wr = (STATS["wins"] / n * 100) if n else 0.0
+    return (f"Pool: {money(pool)} USDT (start {money(START_CAPITAL)}) | Free: {money(free)}\n"
+            f"Total net PnL: {money(STATS['pnl'], True)} USDT | Trades: {n} | "
+            f"Wins: {STATS['wins']} | Losses: {STATS['losses']} | Win rate: {wr:.1f}%\n"
+            f"Open trades: {len(POSITIONS)}")
+
+
+def open_position(sym, st, candle, arm, ind):
+    price = candle[4]
+    retrace = (arm["r_high"] - arm["pb_low"]) / arm["rng"] * 100
+    pos = {
+        "sym": sym, "head": name_block(sym), "stage": arm["stage"],
+        "entry_price": price, "qty": TRADE_SIZE / price, "size": TRADE_SIZE,
+        "entry_fee": TRADE_SIZE * FEE_PCT / 100, "entry_ms": int(time.time() * 1000),
+        "entry_t": candle[0], "level": arm["level"],
+        "rally_n": arm["rally_n"], "pb_n": arm["pb_n"], "retrace": retrace,
+        "rvol": arm["rvol"], "vol_ratio": arm["vol_ratio"],
+        "ind": {k: ind[k] for k in ("e9", "e20", "vwap", "e200", "macd", "sig")},
+    }
+    POSITIONS[sym] = pos
+    st.chain_n += 1
+    st.chain_entry_t = candle[0]
+    text = (
+        f"🟢 DEMO TRADE OPENED - RALLY{pos['stage']} ENTRY\n"
+        f"{pos['head']}\n"
+        f"Time: {utc_now()}\n\n"
+        f"Entry price: {fmt(price)}\n"
+        f"Quantity: {fmt(pos['qty'])}\n"
+        f"Trade size: {money(TRADE_SIZE)} USDT | Entry fee: {money(pos['entry_fee'])} USDT ({FEE_PCT:g}%)\n"
+        f"Breakout level (high of pullback's 1st red candle): {fmt(pos['level'])}\n"
+        f"Exit rules: price back below {fmt(pos['level'])}, or the next red candle starts\n\n"
+        f"Setup:\n"
+        f"Rally: {pos['rally_n']} green | Pullback: {pos['pb_n']} red\n"
+        f"Pullback retracement: {retrace:.1f}% (max {MAX_RETRACE * 100:.0f}%)\n"
+        f"RVOL (rally vs {RVOL_DAYS}-day avg): {pos['rvol']:.1f}x (min {RVOL_MIN:g}x)\n"
+        f"Rally vol / pullback vol: {pos['vol_ratio']:.1f}x\n"
         f"EMA9 {fmt(ind['e9'])} > EMA20 {fmt(ind['e20'])} > VWAP {fmt(ind['vwap'])} > EMA200 {fmt(ind['e200'])}\n"
-        f"MACD {fmt(ind['macd'])} > Signal {fmt(ind['sig'])}"
-        f"{link}"
+        f"MACD {fmt(ind['macd'])} > Signal {fmt(ind['sig'])}\n\n"
+        f"{account_lines()}"
     )
+    emit(text)
+    schedule_save()
+
+
+def close_position(sym, st, price, reason):
+    pos = POSITIONS.pop(sym, None)
+    if not pos:
+        return
+    value = pos["qty"] * price
+    gross = value - pos["size"]
+    exit_fee = value * FEE_PCT / 100
+    net = gross - pos["entry_fee"] - exit_fee
+    STATS["pnl"] += net
+    STATS["trades"] += 1
+    STATS["wins" if net > 0 else "losses"] += 1
+    if st is not None:
+        st.chain_t = int(time.time() * 1000)
+    held = max(0, (int(time.time() * 1000) - pos["entry_ms"]) // 1000)
+    move = (price / pos["entry_price"] - 1) * 100
+    icon = "✅" if net > 0 else "❌"
+    text = (
+        f"{icon} DEMO TRADE CLOSED - RALLY{pos['stage']} TRADE\n"
+        f"{pos['head']}\n"
+        f"Time: {utc_now()}\n"
+        f"Reason: {reason}\n\n"
+        f"Entry: {fmt(pos['entry_price'])} -> Exit: {fmt(price)} ({move:+.2f}%)\n"
+        f"Held: {held // 60}m {held % 60}s\n"
+        f"Size: {money(pos['size'])} USDT\n"
+        f"Gross PnL: {money(gross, True)} USDT\n"
+        f"Fees (entry + exit): {money(pos['entry_fee'] + exit_fee)} USDT\n"
+        f"NET PnL: {money(net, True)} USDT ({net / pos['size'] * 100:+.2f}%)\n\n"
+        f"Setup was: retracement {pos['retrace']:.1f}% | RVOL {pos['rvol']:.1f}x | "
+        f"rally vol/pullback vol {pos['vol_ratio']:.1f}x\n\n"
+        f"{account_lines()}"
+    )
+    emit(text)
+    schedule_save()
+
+
+# ----------------------------- STATE PERSISTENCE ----------------------------
+def state_text():
+    names = ", ".join(p["sym"] for p in POSITIONS.values()) or "none"
+    return (f"📌 {STATE_MARK} (do not delete - bot memory)\n"
+            f"{account_lines()}\nOpen: {names}\n"
+            f"STATE:" + json.dumps({"stats": STATS, "positions": list(POSITIONS.values())},
+                                   separators=(",", ":")))
+
+
+async def tg_state_write(text):
+    global _state_msg_id
+    if not TOKEN or not CHAT_ID:
+        return
+    if _state_msg_id:
+        r = await tg_api("editMessageText", {"chat_id": CHAT_ID, "message_id": _state_msg_id, "text": text})
+        if r is None:
+            return                                   # network problem, retry on next save
+        if r.get("ok") or "not modified" in str(r.get("description", "")):
+            return
+        _state_msg_id = None                         # message gone -> create a new one
+    r = await tg_api("sendMessage", {"chat_id": CHAT_ID, "text": text, "disable_notification": True})
+    if r and r.get("ok"):
+        _state_msg_id = r["result"]["message_id"]
+        await tg_api("pinChatMessage",
+                     {"chat_id": CHAT_ID, "message_id": _state_msg_id, "disable_notification": True})
+
+
+async def _saver():
+    global _save_dirty, _save_running
+    try:
+        while _save_dirty:
+            _save_dirty = False
+            text = state_text()
+            try:
+                with open(STATE_PATH, "w") as f:
+                    f.write(text)
+            except Exception as e:
+                log.warning("State file write failed: %r", e)
+            await tg_state_write(text)
+            await asyncio.sleep(1)
+    finally:
+        _save_running = False
+
+
+def schedule_save():
+    global _save_dirty, _save_running
+    _save_dirty = True
+    if not _save_running:
+        _save_running = True
+        asyncio.ensure_future(_saver())
+
+
+async def load_state():
+    """Restore pool / stats / open trades from the pinned Telegram message (or the local backup file)."""
+    global _state_msg_id
+    text = None
+    r = await tg_api("getChat", {"chat_id": CHAT_ID})
+    pm = r["result"].get("pinned_message") if (r and r.get("ok")) else None
+    if pm and STATE_MARK in (pm.get("text") or ""):
+        _state_msg_id = pm["message_id"]
+        text = pm["text"]
+    if not text:
+        try:
+            with open(STATE_PATH) as f:
+                text = f.read()
+        except Exception:
+            text = None
+    if not text or "STATE:" not in text:
+        return
+    try:
+        data = json.loads(text.split("STATE:", 1)[1].strip())
+        STATS.update({k: data["stats"][k] for k in STATS})
+        for p in data.get("positions", []):
+            POSITIONS[p["sym"]] = p
+        log.info("State restored: pnl=%s trades=%s open=%d", money(STATS["pnl"], True), STATS["trades"], len(POSITIONS))
+    except Exception as e:
+        log.warning("Could not parse saved state: %r", e)
+
+
+# ----------------------------- ENTRY / EXIT LOGIC ---------------------------
+def make_arm(st, res):
+    """Decide whether a fresh rally+pullback may become an entry (rally2 / rally3 chain)."""
+    if st.chain_n and res["pb_start_t"] - max(st.chain_t, st.chain_entry_t) > CHAIN_RESET_MS:
+        st.chain_n = 0                                   # chain expired -> start over
+    if st.chain_n >= 2:                                  # rally2 and rally3 already traded
+        return None
+    if st.chain_n == 1 and res["pb_start_t"] <= st.chain_entry_t:
+        return None                                      # pullback must come AFTER the traded rally
+    arm = dict(res)
+    arm["stage"] = st.chain_n + 2
+    return arm
+
+
+def on_close(sym, st):
+    """Called after a 5m candle closed (and was appended to st.candles)."""
+    if sym in POSITIONS:
+        st.arm = None
+        return
+    cs = st.candles
+    res = eval_setup(cs, st.base)
+    if res:
+        st.arm = make_arm(st, res)
+        return
+    arm = st.arm
+    if not arm:
+        return
+    last = cs[-1]
+    if last[4] < last[1] or last[0] <= arm["last_t"]:     # red candle that failed the checks -> setup dead
+        st.arm = None
+        return
+    if last[3] < arm["pb_low"]:
+        arm["pb_low"] = last[3]
+    if ((arm["r_high"] - arm["pb_low"]) / arm["rng"] >= MAX_RETRACE
+            or last[0] - arm["last_t"] >= MAX_WAIT_CANDLES * TF_MS):
+        st.arm = None
+
+
+def try_entry(sym, st, candle):
+    """Live tick: enter the moment price breaks the pullback's first red candle high."""
+    arm = st.arm
+    t, o, h, l, c = candle[:5]
+    if t <= arm["last_t"]:
+        return
+    if t - arm["last_t"] > MAX_WAIT_CANDLES * TF_MS:
+        st.arm = None
+        return
+    if l < arm["pb_low"]:                                  # pullback got deeper while waiting
+        arm["pb_low"] = l
+        if (arm["r_high"] - l) / arm["rng"] >= MAX_RETRACE:
+            st.arm = None
+            return
+    if c <= arm["level"] or c <= o:                        # no breakout yet / candle not green
+        return
+
+    st.arm = None                                          # breakout moment: judged once
+    if sym in POSITIONS or not (MIN_PRICE <= c <= MAX_PRICE):
+        return
+    if pool_free()[1] < TRADE_SIZE:                        # no free capital
+        return
+    ind = trend_check(st.candles, candle)
+    if not ind or not ind["ok"]:
+        return
+    open_position(sym, st, candle, arm, ind)
+
+
+def check_exit(sym, st, pos, candle):
+    t, o, h, l, c = candle[:5]
+    if c < pos["level"]:
+        close_position(sym, st, c, "PRICE FELL BACK BELOW THE BREAKOUT LEVEL")
+    elif t > pos["entry_t"] and c < o:
+        close_position(sym, st, c, "RED CANDLE STARTED (end of the rally)")
 
 
 # ----------------------------- BINANCE REST ---------------------------------
@@ -376,7 +666,9 @@ async def seed_symbol(session, sym, sem):
     ]
     st = STATE.setdefault(sym, Sym())
     st.candles = cs[-HIST:]
-    st.setup = eval_setup(st.candles, st.base)
+    res = eval_setup(st.candles, st.base)
+    if res and sym not in POSITIONS and now_ms - res["last_t"] <= (MAX_WAIT_CANDLES + 1) * TF_MS:
+        st.arm = make_arm(st, res)
     return True
 
 
@@ -388,7 +680,6 @@ async def refresh_base(session, sym):
     st.base_day = int(time.time() * 1000) // DAY_MS      # mark first so we don't spawn duplicates
     async with REST_SEM:
         await load_base(session, sym)
-    st.setup = eval_setup(st.candles, st.base)
 
 
 async def reseed(session, sym):
@@ -404,7 +695,7 @@ async def reseed(session, sym):
 
 # ----------------------------- STREAM HANDLING ------------------------------
 def handle_message(raw, session, loop_tasks):
-    global _last_beat, _alerts_sent
+    global _last_beat
     _last_beat = time.time()
     d = json.loads(raw)
     payload = d.get("data", d) if isinstance(d, dict) else None
@@ -419,6 +710,10 @@ def handle_message(raw, session, loop_tasks):
     t = int(k["t"])
     candle = (t, float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]))
 
+    pos = POSITIONS.get(sym)
+    if pos:                                   # open trade: exit rules run on every tick
+        check_exit(sym, st, pos, candle)
+
     if k["x"]:  # candle closed
         cs = st.candles
         if cs and cs[-1][0] == t:
@@ -432,33 +727,17 @@ def handle_message(raw, session, loop_tasks):
             cs.append(candle)
         else:
             # spot gap -> missed candles, reload history
-            st.setup = None
+            st.arm = None
             loop_tasks.append(asyncio.ensure_future(reseed(session, sym)))
             return
-        st.setup = eval_setup(cs, st.base)
+        on_close(sym, st)
         if t // DAY_MS != st.base_day and (int(time.time() * 1000) // DAY_MS) != st.base_day:
             loop_tasks.append(asyncio.ensure_future(refresh_base(session, sym)))
         return
 
-    # live tick of forming candle
-    setup = st.setup
-    if not setup or st.alerted_t == t:
-        return
-    if t != setup["last_t"] + TF_MS:      # must be the candle right after the pullback
-        return
-    if candle[4] <= candle[1]:            # not green (yet)
-        return
-    if not (MIN_PRICE <= candle[4] <= MAX_PRICE):   # price filter
-        return
-
-    ind = trend_check(st.candles, candle)
-    if not ind or not ind["ok"]:
-        return
-
-    st.alerted_t = t
-    _alerts_sent += 1
-    log.info("ALERT %s price=%s rvol=%.1fx retrace=%.1f%%", sym, fmt(candle[4]), setup["rvol"], setup["retrace"])
-    loop_tasks.append(asyncio.ensure_future(tg_send(session, build_alert(sym, candle, setup, ind))))
+    # live tick of the forming candle
+    if st.arm and sym not in POSITIONS:
+        try_entry(sym, st, candle)
 
 
 async def ws_worker(idx, syms, session):
@@ -523,20 +802,16 @@ def watchdog():
             os._exit(1)
 
 
-async def health_logger():
-    while True:
-        await asyncio.sleep(1800)
-        armed = sum(1 for s in STATE.values() if s.setup)
-        log.info("HEALTH symbols=%d armed_setups=%d alerts_sent=%d", len(STATE), armed, _alerts_sent)
-
-
 # ----------------------------- MAIN -----------------------------------------
 async def main():
     if not TOKEN or not CHAT_ID:
         log.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway variables")
     threading.Thread(target=watchdog, daemon=True).start()
 
+    global SESSION
     async with aiohttp.ClientSession() as session:
+        SESSION = session
+        await load_state()
         symbols, spot_bases = await get_symbols(session)
         if not symbols:
             log.error("Could not load symbols (Binance blocked? Set Railway region to EU West) -> exit")
@@ -552,14 +827,22 @@ async def main():
         symbols = [s for s in symbols if s in STATE and STATE[s].candles and STATE[s].base]
         alpha = [s for s in alpha if s in STATE and STATE[s].candles and STATE[s].base]
 
+        # open trades whose coin is no longer scanned can never exit -> close them flat (fees only)
+        scanned = set(symbols) | set(alpha)
+        for sym in list(POSITIONS):
+            if sym not in scanned:
+                close_position(sym, STATE.get(sym), POSITIONS[sym]["entry_price"], "COIN NO LONGER AVAILABLE AFTER RESTART")
+
         global _last_beat
         _last_beat = time.time()
+        log.info("DEMO BOT running | pool %s | open trades %d | scanning %d spot + %d alpha (no scan messages)",
+                 money(pool_free()[0]), len(POSITIONS), len(symbols), len(alpha))
+        schedule_save()
 
         chunks = [symbols[i:i + STREAMS_PER_CONN] for i in range(0, len(symbols), STREAMS_PER_CONN)]
         tasks = [asyncio.create_task(ws_worker(i + 1, c, session)) for i, c in enumerate(chunks)]
         achunks = [alpha[i:i + ALPHA_STREAMS_PER_CONN] for i in range(0, len(alpha), ALPHA_STREAMS_PER_CONN)]
         tasks += [asyncio.create_task(alpha_ws_worker(i + 1, c, session)) for i, c in enumerate(achunks)]
-        tasks.append(asyncio.create_task(health_logger()))
         await asyncio.gather(*tasks)
 
 
